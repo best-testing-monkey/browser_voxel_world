@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Browser Voxel World</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --panel-bg: rgba(16, 18, 24, 0.82);
+    --panel-border: rgba(255, 255, 255, 0.14);
+    --accent: #7fc8ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0d12;
+    font-family: "Segoe UI", system-ui, sans-serif; color: #e8eaf0; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  .overlay { position: fixed; pointer-events: none; }
+
+  #crosshair { left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: 18px; height: 18px; opacity: 0.9; }
+  #crosshair::before, #crosshair::after { content: ""; position: absolute;
+    background: #fff; mix-blend-mode: difference; }
+  #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
+  #crosshair::after { left: 0; top: 8px; width: 18px; height: 2px; }
+
+  #hud-top { top: 10px; left: 10px; display: flex; flex-direction: column;
+    gap: 6px; max-width: 380px; }
+  .panel { background: var(--panel-bg); border: 1px solid var(--panel-border);
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; line-height: 1.45;
+    backdrop-filter: blur(4px); }
+  .panel b { color: var(--accent); }
+  #scene-info { font-size: 13px; }
+  #scene-info select { pointer-events: auto; margin-top: 4px; }
+  #target-info { font-size: 12px; min-height: 17px; color: #c2ceda; }
+
+  #hotbar { bottom: 14px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 6px; }
+  .slot { width: 58px; height: 58px; border: 2px solid var(--panel-border);
+    border-radius: 8px; background: var(--panel-bg); position: relative;
+    display: flex; align-items: center; justify-content: center; }
+  .slot.active { border-color: var(--accent);
+    box-shadow: 0 0 10px rgba(127, 200, 255, 0.55); }
+  .slot .swatch { width: 34px; height: 34px; border-radius: 5px;
+    border: 1px solid rgba(0,0,0,0.5); }
+  .slot .num { position: absolute; top: 2px; left: 5px; font-size: 10px;
+    color: #9aa7b5; }
+  .slot .count { position: absolute; bottom: 2px; right: 5px; font-size: 11px;
+    font-weight: 600; text-shadow: 0 1px 2px #000; }
+  .slot .label { position: absolute; bottom: -18px; left: 50%;
+    transform: translateX(-50%); font-size: 9px; white-space: nowrap;
+    color: #93a1b0; max-width: 70px; overflow: hidden;
+    text-overflow: ellipsis; display: none; }
+  .slot.active .label { display: block; }
+
+  #hint { bottom: 92px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: #aeb9c6; text-shadow: 0 1px 2px #000; }
+
+  /* fullscreen modals */
+  .modal { position: fixed; inset: 0; display: none; align-items: center;
+    justify-content: center; background: rgba(5, 7, 12, 0.72); z-index: 20; }
+  .modal.visible { display: flex; }
+  .modal-card { background: #141821; border: 1px solid var(--panel-border);
+    border-radius: 12px; padding: 20px 24px; width: min(860px, 92vw);
+    max-height: 86vh; display: flex; flex-direction: column; }
+  .modal-card h2 { margin: 0 0 10px; font-size: 18px; color: var(--accent); }
+
+  #start-card { text-align: left; width: min(560px, 92vw); }
+  #start-card ul { margin: 8px 0; padding-left: 20px; }
+  #start-card li { margin: 3px 0; font-size: 14px; }
+  #start-btn, .btn { margin-top: 12px; padding: 10px 18px; font-size: 15px;
+    background: var(--accent); border: none; border-radius: 8px;
+    color: #08121c; font-weight: 700; cursor: pointer; }
+  select { background: #0e1219; color: #e8eaf0; border: 1px solid
+    var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px; }
+
+  #mat-search { width: 100%; padding: 8px 10px; font-size: 14px;
+    background: #0e1219; border: 1px solid var(--panel-border);
+    border-radius: 8px; color: #e8eaf0; margin-bottom: 10px; }
+  #mat-grid { overflow-y: auto; display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+  .mat-tile { display: flex; gap: 8px; align-items: center; padding: 6px;
+    border: 1px solid transparent; border-radius: 7px; cursor: pointer;
+    background: rgba(255,255,255,0.03); }
+  .mat-tile:hover { border-color: var(--accent); }
+  .mat-tile .sw { width: 26px; height: 26px; border-radius: 5px;
+    flex: 0 0 auto; border: 1px solid rgba(0,0,0,0.5); }
+  .mat-tile .nm { font-size: 11px; line-height: 1.25; }
+  .mat-tile .cat { font-size: 9px; color: #8b98a7; }
+  #mat-count { font-size: 12px; color: #8b98a7; margin-bottom: 8px; }
+
+  #inv-list { overflow-y: auto; font-size: 13px; }
+  #inv-list table { width: 100%; border-collapse: collapse; }
+  #inv-list td { padding: 4px 6px; border-bottom: 1px solid
+    rgba(255,255,255,0.06); }
+  #inv-list .sw { width: 18px; height: 18px; border-radius: 4px;
+    display: inline-block; vertical-align: middle;
+    border: 1px solid rgba(0,0,0,0.5); }
+  .muted { color: #8b98a7; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="crosshair" class="overlay" hidden></div>
+
+<div id="hud-top" class="overlay" hidden>
+  <div class="panel" id="scene-info"></div>
+  <div class="panel" id="target-info"></div>
+</div>
+
+<div id="hint" class="overlay" hidden>
+  LMB mine &nbsp;·&nbsp; RMB place &nbsp;·&nbsp; MMB pick &nbsp;·&nbsp;
+  1–9 slots &nbsp;·&nbsp; E materials &nbsp;·&nbsp; Q inventory &nbsp;·&nbsp;
+  Esc release mouse
+</div>
+
+<div id="hotbar" class="overlay" hidden></div>
+
+<div id="start-modal" class="modal visible">
+  <div class="modal-card" id="start-card">
+    <h2>Browser Voxel World</h2>
+    <div id="loading-status" class="muted">Loading scene from Python backend…</div>
+    <div id="start-ready" hidden>
+      <p>Scene:
+        <select id="scene-select"></select>
+      </p>
+      <ul>
+        <li><b>WASD</b> move · <b>mouse</b> look · <b>Space / Shift</b> fly up / down · hold <b>F</b> to sprint</li>
+        <li><b>Left click</b> destroy a block (it is stored in your inventory)</li>
+        <li><b>Right click</b> create a block from the selected hotbar slot</li>
+        <li><b>Middle click</b> pick the targeted material into the hotbar</li>
+        <li><b>E</b> browse all 1024+ materials · <b>Q</b> view stored blocks</li>
+      </ul>
+      <button id="start-btn">Click to play</button>
+    </div>
+  </div>
+</div>
+
+<div id="mat-modal" class="modal">
+  <div class="modal-card">
+    <h2>Material Browser</h2>
+    <div id="mat-count"></div>
+    <input id="mat-search" type="text"
+           placeholder="Search materials… (Esc to close, click to assign to active slot)">
+    <div id="mat-grid"></div>
+  </div>
+</div>
+
+<div id="inv-modal" class="modal">
+  <div class="modal-card">
+    <h2>Stored Blocks</h2>
+    <div id="inv-list"></div>
+  </div>
+</div>
+
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>
