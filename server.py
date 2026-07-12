@@ -64,6 +64,33 @@ ACTIONS = ("touch", "light", "pressure")
 MATERIAL_ACTION = {m["id"]: m.get("action") for m in MATERIALS
                    if m.get("action")}
 
+# World clock: apparent time of day, advanced at `speed` x realtime
+# (default 4x). The backend owns the clock; clients render sun/sky from it.
+TIME_LOCK = threading.Lock()
+TIME_STATE = {"apparent": 9.0, "speed": 4.0, "setAt": time.time()}
+
+
+def time_payload():
+    with TIME_LOCK:
+        elapsed_h = (time.time() - TIME_STATE["setAt"]) / 3600.0
+        hours = (TIME_STATE["apparent"]
+                 + elapsed_h * TIME_STATE["speed"]) % 24.0
+        return {"apparentHours": round(hours, 4),
+                "speed": TIME_STATE["speed"]}
+
+
+def set_time(apparent_hours=None, speed=None):
+    with TIME_LOCK:
+        elapsed_h = (time.time() - TIME_STATE["setAt"]) / 3600.0
+        current = (TIME_STATE["apparent"]
+                   + elapsed_h * TIME_STATE["speed"]) % 24.0
+        TIME_STATE["apparent"] = (current if apparent_hours is None
+                                  else apparent_hours % 24.0)
+        if speed is not None:
+            TIME_STATE["speed"] = speed
+        TIME_STATE["setAt"] = time.time()
+
+
 # Event stream for external subscribers: every sensor event gets a global
 # sequence number; poll GET /api/events?since=N or register a webhook with
 # POST /api/subscribe.
@@ -154,6 +181,14 @@ def load_state():
     except (OSError, json.JSONDecodeError) as err:
         print(f"warning: could not load {STATE_FILE.name}: {err}")
         return
+    saved_time = data.get("time")
+    if saved_time:
+        with TIME_LOCK:
+            TIME_STATE.update({
+                "apparent": float(saved_time.get("apparent", 9.0)),
+                "speed": float(saved_time.get("speed", 4.0)),
+                "setAt": float(saved_time.get("setAt", time.time())),
+            })
     for scene, stores in data.get("scenes", {}).items():
         if scene not in SCENES:
             continue
@@ -187,6 +222,8 @@ def save_state():
                     for (x, y, z, s), m in SUBVOXELS[name].items()],
             "screens": list(SCENES[name].screens.values()),
         } for name in SCENES}}
+    with TIME_LOCK:
+        data["time"] = dict(TIME_STATE)
     tmp = STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data))
     tmp.replace(STATE_FILE)
@@ -312,6 +349,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_updates(parse_qs(parsed.query))
         if path == "/api/events":
             return self.handle_events_get(parse_qs(parsed.query))
+        if path == "/api/time":
+            return self.send_json(time_payload())
         return self.handle_static(path)
 
     def do_POST(self):
@@ -324,6 +363,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_screens_post()
         if parsed.path == "/api/subscribe":
             return self.handle_subscribe()
+        if parsed.path == "/api/time":
+            return self.handle_time_post()
         self.send_error_json("not found", 404)
 
     def read_body_json(self):
@@ -555,6 +596,38 @@ class Handler(BaseHTTPRequestHandler):
             seq = EVENT_SEQ
         self.send_json({"events": events, "seq": seq})
 
+    def handle_time_post(self):
+        """Set the apparent time of day and/or the clock speed.
+        {"time": 18.5 | "18:30" (optional), "speed": 4.0 (optional)}"""
+        try:
+            payload = self.read_body_json()
+        except (ValueError, json.JSONDecodeError):
+            return self.send_error_json("bad time payload")
+        hours = None
+        if "time" in payload:
+            raw = payload["time"]
+            try:
+                if isinstance(raw, str) and ":" in raw:
+                    hh, mm = raw.split(":", 1)
+                    hours = int(hh) + int(mm) / 60.0
+                else:
+                    hours = float(raw)
+            except (TypeError, ValueError):
+                return self.send_error_json("time must be hours or HH:MM")
+            if not 0 <= hours < 24:
+                return self.send_error_json("time must be within 0-24 h")
+        speed = None
+        if "speed" in payload:
+            try:
+                speed = float(payload["speed"])
+            except (TypeError, ValueError):
+                return self.send_error_json("speed must be a number")
+            if not 0 <= speed <= 86400:
+                return self.send_error_json("speed must be 0-86400")
+        set_time(hours, speed)
+        save_state()
+        self.send_json(time_payload())
+
     def handle_subscribe(self):
         try:
             payload = self.read_body_json()
@@ -591,6 +664,7 @@ class Handler(BaseHTTPRequestHandler):
             "screens": {sid: s["version"]
                         for sid, s in SCENES[scene].screens.items()},
             "eventSeq": seq,
+            "time": time_payload(),
         }
         if edits is not None:
             out["edits"] = edits

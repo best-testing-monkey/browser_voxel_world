@@ -84,6 +84,25 @@ event. Subscribers are dropped after 5 consecutive delivery failures.
 every event in-process — the demo uses it to rewrite the Sensor Board
 screen and toggle indicator blocks. Edit it to build your own logic.
 
+## World clock (day/night)
+
+The backend owns the apparent time of day. Clients render the sun, moon,
+stars and sky colours from it. The default clock runs at **4× realtime**
+(one full day every 6 hours).
+
+### `GET /api/time`
+`{"apparentHours": 14.53, "speed": 4.0}` — hours are 0–24.
+
+### `POST /api/time` — set apparent time and/or clock speed
+```json
+{"time": "18:30", "speed": 60}
+```
+`time` accepts decimal hours (`18.5`) or `"HH:MM"`; `speed` is the
+multiplier over realtime (0 freezes the sky, up to 86400 = one day per
+second). Both fields are optional. The clock persists across restarts and
+is echoed in every `GET /api/updates` response, so browsers resync within
+~2 s.
+
 ## Fluids
 
 Fluid behaviour is configured by the backend (`fluids` in `/api/config`)

@@ -41,6 +41,7 @@ const state = {
   rev: 0,                       // last world revision seen from the backend
   lightGaze: null,              // cell key currently firing the light sensor
   pressureCell: null,           // cell key currently holding a pressure plate
+  noclip: false,                // N toggles collision off for free flight
 };
 
 let screenMgr = null;           // created once config is loaded
@@ -66,8 +67,100 @@ const camera = new THREE.PerspectiveCamera(
 const sun = new THREE.DirectionalLight(0xffffff, 2.2);
 sun.position.set(0.45, 1, 0.3);
 scene3.add(sun);
-scene3.add(new THREE.AmbientLight(0xbfd4ea, 0.9));
-scene3.add(new THREE.HemisphereLight(0xcfe5ff, 0x6b6252, 0.5));
+const ambientLight = new THREE.AmbientLight(0xbfd4ea, 0.9);
+scene3.add(ambientLight);
+const hemiLight = new THREE.HemisphereLight(0xcfe5ff, 0x6b6252, 0.5);
+scene3.add(hemiLight);
+
+// ---------------------------------------------------------------------------
+// Day/night cycle. The backend owns the clock (GET/POST /api/time); the
+// client renders a procedural sky from the apparent hour: sun + moon discs,
+// stars at night, and sky/fog/light colours blended through dawn and dusk.
+// ---------------------------------------------------------------------------
+const timeState = { hours: 9, speed: 4, syncedAt: performance.now() };
+
+function syncTime(t) {
+  if (!t) return;
+  timeState.hours = t.apparentHours;
+  timeState.speed = t.speed;
+  timeState.syncedAt = performance.now();
+}
+
+function apparentHours() {
+  const elapsedH = (performance.now() - timeState.syncedAt) / 3600000;
+  return ((timeState.hours + elapsedH * timeState.speed) % 24 + 24) % 24;
+}
+
+const SKY_DAY = new THREE.Color(0x87b5e0);
+const SKY_NIGHT = new THREE.Color(0x0a0f22);
+const SKY_DUSK = new THREE.Color(0xd97b4a);
+const SUN_DAY = new THREE.Color(0xffffff);
+const SUN_LOW = new THREE.Color(0xffb066);
+const skyColor = new THREE.Color();
+
+const sunMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(14, 20, 20),
+  new THREE.MeshBasicMaterial({ color: 0xffdd88, fog: false }));
+const moonMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(9, 20, 20),
+  new THREE.MeshBasicMaterial({ color: 0xd8e2f5, fog: false }));
+scene3.add(sunMesh, moonMesh);
+
+const stars = (() => {
+  const positions = [];
+  for (let i = 0; i < 900; i++) {
+    const v = new THREE.Vector3().randomDirection().multiplyScalar(400);
+    if (v.y > -30) positions.push(v.x, v.y, v.z);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0xffffff, size: 1.7, sizeAttenuation: false,
+    transparent: true, opacity: 0, fog: false });
+  const points = new THREE.Points(geo, mat);
+  points.frustumCulled = false;
+  scene3.add(points);
+  return points;
+})();
+
+const _sunDir = new THREE.Vector3();
+let lastClockText = '';
+
+function updateSky() {
+  const h = apparentHours();
+  const ang = (h - 6) / 24 * Math.PI * 2; // 06:00 sunrise, 18:00 sunset
+  _sunDir.set(Math.cos(ang), Math.sin(ang), 0.3).normalize();
+  const elev = _sunDir.y;
+  const day = THREE.MathUtils.smoothstep(elev, -0.06, 0.18);
+  const dusk = Math.max(0, 1 - Math.abs(elev) / 0.22);
+
+  skyColor.copy(SKY_NIGHT).lerp(SKY_DAY, day).lerp(SKY_DUSK, dusk * 0.5);
+  scene3.background = skyColor;
+  if (scene3.fog) scene3.fog.color.copy(skyColor);
+
+  sun.position.copy(_sunDir);
+  sun.intensity = 0.1 + 2.3 * day;
+  sun.color.copy(SUN_DAY).lerp(SUN_LOW, dusk);
+  ambientLight.intensity = 0.22 + 0.68 * day;
+  hemiLight.intensity = 0.12 + 0.42 * day;
+
+  sunMesh.position.copy(camera.position).addScaledVector(_sunDir, 380);
+  moonMesh.position.copy(camera.position).addScaledVector(_sunDir, -380);
+  stars.material.opacity = (1 - day) * 0.9;
+  stars.position.copy(camera.position);
+  stars.rotation.z = ang * 0.25;
+
+  const clockEl = document.getElementById('clock');
+  if (clockEl) {
+    const hh = String(Math.floor(h)).padStart(2, '0');
+    const mm = String(Math.floor((h % 1) * 60)).padStart(2, '0');
+    const text = `☀ ${hh}:${mm} · ${timeState.speed}× realtime`;
+    if (text !== lastClockText) {
+      lastClockText = text;
+      clockEl.textContent = text;
+    }
+  }
+}
 
 const chunkMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
 
@@ -854,6 +947,7 @@ async function pollUpdates() {
     state.rev = p.rev;
     for (const e of p.edits || []) applyRemoteEdit(e);
     if (screenMgr) screenMgr.applyVersions(p.screens || {});
+    syncTime(p.time);
   } catch { /* transient network error; next poll retries */ }
 }
 setInterval(pollUpdates, 2000);
@@ -1025,6 +1119,10 @@ document.addEventListener('keydown', (e) => {
 
   if (e.code === 'KeyG') cycleVoxelSize(1);   // smaller
   if (e.code === 'KeyV') cycleVoxelSize(-1);  // bigger
+  if (e.code === 'KeyN') {
+    state.noclip = !state.noclip;
+    showToast(`No-clip ${state.noclip ? 'on — collision off' : 'off — collision on'}`);
+  }
 
   if (e.code.startsWith('Digit')) {
     const n = parseInt(e.code.slice(5), 10);
@@ -1083,6 +1181,39 @@ let lastLampUpdate = 0;
 let fluidAcc = 0;
 const FLUID_TICK = 0.1; // seconds; the config's tickMs is advisory
 
+// Player collision: an axis-aligned box around the camera (eye point) that
+// may not intersect solid matter — base voxels or sub-voxels of any size.
+const PLAYER_HALF = 0.32;   // half width (m)
+const PLAYER_DOWN = 1.55;   // eye to feet
+const PLAYER_UP = 0.25;     // eye to top of head
+
+function boxCollides(px, py, pz) {
+  const minX = px - PLAYER_HALF, maxX = px + PLAYER_HALF;
+  const minY = py - PLAYER_DOWN, maxY = py + PLAYER_UP;
+  const minZ = pz - PLAYER_HALF, maxZ = pz + PLAYER_HALF;
+  for (let bx = Math.floor(minX); bx <= Math.floor(maxX); bx++) {
+    for (let by = Math.floor(minY); by <= Math.floor(maxY); by++) {
+      for (let bz = Math.floor(minZ); bz <= Math.floor(maxZ); bz++) {
+        if (getVoxel(bx, by, bz)) return true;
+      }
+    }
+  }
+  const c0x = Math.floor(minX / CX), c1x = Math.floor(maxX / CX);
+  const c0z = Math.floor(minZ / CZ), c1z = Math.floor(maxZ / CZ);
+  for (let cz = c0z; cz <= c1z; cz++) {
+    for (let cx = c0x; cx <= c1x; cx++) {
+      const chunk = state.chunks.get(chunkKey(cx, cz));
+      if (!chunk || !chunk.sub || chunk.sub.size === 0) continue;
+      for (const sv of chunk.sub.values()) {
+        if (minX * MM < sv.x + sv.s && maxX * MM > sv.x &&
+            minY * MM < sv.y + sv.s && maxY * MM > sv.y &&
+            minZ * MM < sv.z + sv.s && maxZ * MM > sv.z) return true;
+      }
+    }
+  }
+  return false;
+}
+
 function updateMovement(dt) {
   if (anyModalOpen()) return;
   const speed = FLY_SPEED * (state.keys.has('KeyF') ? SPRINT_MULT : 1);
@@ -1098,7 +1229,18 @@ function updateMovement(dt) {
   if (state.keys.has('ShiftLeft') || state.keys.has('ShiftRight')) move.y -= 1;
   if (move.lengthSq() > 0) {
     move.normalize().multiplyScalar(speed * dt);
-    state.pos.add(move);
+    if (state.noclip) {
+      state.pos.add(move);
+    } else {
+      // Resolve each axis separately so we slide along walls. If we are
+      // already stuck inside something (e.g. a block placed on us), allow
+      // movement so the player can escape.
+      const stuck = boxCollides(state.pos.x, state.pos.y, state.pos.z);
+      const p = state.pos;
+      if (stuck || !boxCollides(p.x + move.x, p.y, p.z)) p.x += move.x;
+      if (stuck || !boxCollides(p.x, p.y + move.y, p.z)) p.y += move.y;
+      if (stuck || !boxCollides(p.x, p.y, p.z + move.z)) p.z += move.z;
+    }
   }
   state.pos.y = Math.max(1, Math.min(CY + 40, state.pos.y));
 }
@@ -1133,6 +1275,7 @@ function animate() {
 
     state.target = raycastVoxel();
     updateLightGaze();
+    updateSky();
     if (state.target) {
       const t = state.target;
       highlight.position.set(
@@ -1246,13 +1389,16 @@ async function boot() {
   }
 
   defaultHotbar();
+  try {
+    syncTime(await (await fetch('/api/time')).json());
+  } catch { /* keep the default 09:00 clock until the first poll */ }
   statusEl.hidden = true;
   el('start-ready').hidden = false;
 
   el('start-btn').addEventListener('click', () => {
     state.started = true;
     el('start-modal').classList.remove('visible');
-    for (const id of ['crosshair', 'hud-top', 'hotbar', 'hint']) {
+    for (const id of ['crosshair', 'hud-top', 'hotbar', 'hint', 'clock']) {
       el(id).hidden = false;
     }
     const meta = state.config.scenes.find((s) => s.name === select.value);
@@ -1271,5 +1417,5 @@ window.__voxel = {
   pickBlock, raycastVoxel, storedCount, cycleVoxelSize, decompose,
   toolSizeMm, sendGameEvent, isSolidCell, blockAtCell, loadedFaucets,
   getScreens: () => screenMgr, getFluids: () => fluidSim, pollUpdates,
-  lampLights,
+  lampLights, boxCollides, apparentHours, syncTime, timeState,
 };

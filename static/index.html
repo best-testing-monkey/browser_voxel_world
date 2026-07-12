@@ -99,6 +99,9 @@
     border: 1px solid rgba(0,0,0,0.5); }
   .muted { color: #8b98a7; }
 
+  #clock { position: fixed; top: 10px; right: 12px; font-size: 13px;
+    font-variant-numeric: tabular-nums; }
+
   #toast { right: 16px; bottom: 16px; background: var(--panel-bg);
     border: 1px solid var(--accent); border-radius: 8px; padding: 10px 16px;
     font-size: 13px; opacity: 0; transition: opacity 0.25s; max-width: 320px; }
@@ -115,6 +118,8 @@
   <div class="panel" id="size-info"></div>
   <div class="panel" id="target-info"></div>
 </div>
+
+<div id="clock" class="panel overlay" hidden></div>
 
 <div id="hint" class="overlay" hidden>
   LMB mine/carve &nbsp;·&nbsp; RMB place &nbsp;·&nbsp; MMB pick &nbsp;·&nbsp;
@@ -147,6 +152,9 @@
             the teal pressure plate — the screen wall reacts</li>
         <li>Faucets pour 5&nbsp;cm sand/water/lava — lava + water makes
             obsidian, wood burns in lava, wood floats in water</li>
+        <li>Day/night cycle at 4× realtime (set time/speed via
+            <code>POST /api/time</code>) · solid matter blocks you —
+            press <b>N</b> for no-clip</li>
       </ul>
       <button id="start-btn">Click to play</button>
     </div>

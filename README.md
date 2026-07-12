@@ -60,8 +60,16 @@ nothing to install and starts instantly.
   backend-configured: lava + water freezes to obsidian, wood burns in
   lava, small wooden voxels float up through water, water cools magma to
   coal — and those effects are persisted world edits.
+- **Day/night cycle**: procedural sky with a visible sun, moon and stars,
+  running at 4× realtime by default. The backend owns the clock —
+  `POST /api/time {"time": "18:30", "speed": 60}` sets the apparent time
+  and clock speed, and all connected browsers follow within ~2 s.
+- **Collision**: you can't move through solid matter — base voxels or
+  sub-voxels of any size. Movement resolves per axis so you slide along
+  walls; press **N** to toggle no-clip for free flight.
 - **Full backend API** — see [API.md](API.md) for placing/removing voxels,
-  driving screens and subscribing to sensor events from your own code.
+  driving screens, subscribing to sensor events and setting the clock
+  from your own code.
 - **1024+ materials** (press **E** for the searchable browser): the
   Minecraft block palette (including all 16-color dyed families), modern
   building & construction materials, crafting materials, the full periodic
