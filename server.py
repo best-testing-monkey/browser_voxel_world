@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
 """Python backend for the browser voxel world.
 
 Serves the Three.js frontend from ./static and dictates scene contents via a
-small JSON API. Run with:  python3 server.py [--port 8000]
+small JSON API. Pure standard library — no dependencies.
+
+Run with either:
+    uv run server.py [--port 8000]
+    python3 server.py [--port 8000]
 
 API:
   GET  /api/config                     -> materials, scenes, chunk size, default scene

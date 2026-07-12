@@ -1,0 +1,12 @@
+[project]
+name = "browser-voxel-world"
+version = "0.1.0"
+description = "Browser 3D voxel world: Three.js frontend driven by a pure-stdlib Python backend"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.uv]
+# Pure-stdlib scripts served from the repo directory; nothing to install.
+package = false

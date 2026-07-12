@@ -11,11 +11,17 @@ vendored into the repo.
 ## Run it
 
 ```bash
-python3 server.py            # defaults to http://127.0.0.1:8000
-# or: python3 server.py --port 9000 --host 0.0.0.0
+uv run server.py             # defaults to http://127.0.0.1:8000
+# or plain Python — there are zero dependencies:
+python3 server.py
+# options:
+python3 server.py --port 9000 --host 0.0.0.0
 ```
 
 Open http://127.0.0.1:8000 in a browser, pick a scene, and click **Play**.
+Requires Python ≥ 3.9 (declared via PEP 723 metadata in `server.py` and in
+`pyproject.toml`); the backend is pure standard library, so `uv run` has
+nothing to install and starts instantly.
 
 ## Features
 
