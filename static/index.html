@@ -107,13 +107,14 @@
 
 <div id="hud-top" class="overlay" hidden>
   <div class="panel" id="scene-info"></div>
+  <div class="panel" id="size-info"></div>
   <div class="panel" id="target-info"></div>
 </div>
 
 <div id="hint" class="overlay" hidden>
-  LMB mine &nbsp;·&nbsp; RMB place &nbsp;·&nbsp; MMB pick &nbsp;·&nbsp;
-  1–9 slots &nbsp;·&nbsp; E materials &nbsp;·&nbsp; Q inventory &nbsp;·&nbsp;
-  Esc release mouse
+  LMB mine/carve &nbsp;·&nbsp; RMB place &nbsp;·&nbsp; MMB pick &nbsp;·&nbsp;
+  G/V voxel size &nbsp;·&nbsp; 1–9 slots &nbsp;·&nbsp; E materials &nbsp;·&nbsp;
+  Q inventory &nbsp;·&nbsp; Esc release mouse
 </div>
 
 <div id="hotbar" class="overlay" hidden></div>
@@ -131,6 +132,8 @@
         <li><b>Left click</b> destroy a block (it is stored in your inventory)</li>
         <li><b>Right click</b> create a block from the selected hotbar slot</li>
         <li><b>Middle click</b> pick the targeted material into the hotbar</li>
+        <li><b>G / V</b> voxel size: 1000 → 500 → 100 → 50 → 10 mm.
+            Mining with a small size <i>carves</i> big voxels into smaller ones</li>
         <li><b>E</b> browse all 1024+ materials · <b>Q</b> view stored blocks</li>
       </ul>
       <button id="start-btn">Click to play</button>

@@ -26,6 +26,17 @@ Open http://127.0.0.1:8000 in a browser, pick a scene, and click **Play**.
   a block from the active hotbar slot (stored blocks are consumed first,
   then supply is creative/infinite), middle click picks the targeted
   material into the hotbar.
+- **Variable-size voxels, measured in integer millimetres**: the default
+  voxel is 1000 mm; press **G / V** to cycle the working size through
+  1000 → 500 → 100 → 50 → 10 mm (1 cm is the minimum). Every size divides
+  the previous one, so voxels can be exactly *comprised of smaller voxels*:
+  mining a big voxel with a smaller size **carves** it — the removed piece
+  goes to your inventory and the remainder is decomposed into the largest
+  aligned sub-voxels that fill it (e.g. taking a 10 mm bite out of a
+  1000 mm granite block yields 7×500 + 124×100 + 7×50 + 124×10 mm voxels).
+- **Persistent world**: every edit is POSTed to the backend, which stores
+  it in `world_state.json` — changes survive both page reloads *and server
+  restarts*.
 - **1024+ materials** (press **E** for the searchable browser): the
   Minecraft block palette (including all 16-color dyed families), modern
   building & construction materials, crafting materials, the full periodic
@@ -38,9 +49,6 @@ Open http://127.0.0.1:8000 in a browser, pick a scene, and click **Play**.
     granite. The Perlin noise is generated server-side in pure Python.
   - **Material Museum**: every one of the 1024 materials on a pillar.
   - **Glass Cathedral**: interfering sine ridges of stained glass and gold.
-- **Persistent edits**: block changes are POSTed back to the backend and
-  re-applied when chunks reload, so a page refresh keeps your edits (for the
-  lifetime of the server process).
 
 ## Architecture
 
@@ -60,6 +68,13 @@ Open http://127.0.0.1:8000 in a browser, pick a scene, and click **Play**.
 
 - Chunks are `16 × 64 × 16` grids of `uint16` material ids (0 = air),
   transferred base64-encoded and meshed client-side with face culling.
+- Sub-voxels (all sizes below 1000 mm) live in a sparse overlay keyed by
+  their integer mm origin and size — `(x_mm, y_mm, z_mm, size_mm) → id` —
+  sent alongside each chunk and meshed as scaled boxes in the same
+  vertex-colored geometry.
+- World edits (`op:"set"` for the base grid, `op:"sub"` for smaller voxels)
+  are validated server-side and written atomically to `world_state.json`
+  after every batch, then reloaded at startup.
 - Rendering uses a single vertex-colored `MeshLambertMaterial`; a
   deterministic per-voxel brightness jitter gives stone its speckled look,
   so 1024 materials cost one draw-call material, not 1024.

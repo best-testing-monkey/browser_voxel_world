@@ -14,6 +14,18 @@ CHUNK_X = 16
 CHUNK_Y = 64
 CHUNK_Z = 16
 
+# Voxel sizes are integers in millimetres. The base grid cell (a default
+# voxel) is 1000 mm; voxels can be subdivided into smaller voxels down to
+# MIN_VOXEL_SIZE_MM (1 cm). Each size in the chain divides the previous one,
+# so any larger voxel can be exactly decomposed into smaller ones.
+VOXEL_SIZE_MM = 1000                        # default voxel edge length
+MIN_VOXEL_SIZE_MM = 10                      # 1 cm, the smallest voxel
+VOXEL_SIZES_MM = [1000, 500, 100, 50, 10]   # subdivision chain (2,5,2,5)
+
+assert all(a % b == 0 for a, b in zip(VOXEL_SIZES_MM, VOXEL_SIZES_MM[1:]))
+assert VOXEL_SIZES_MM[0] == VOXEL_SIZE_MM
+assert VOXEL_SIZES_MM[-1] == MIN_VOXEL_SIZE_MM
+
 
 class Perlin2D:
     """Classic 2D Perlin gradient noise with a seeded permutation table."""

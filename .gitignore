@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+world_state.json
+world_state.json.tmp

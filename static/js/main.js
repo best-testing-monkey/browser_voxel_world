@@ -2,12 +2,20 @@ import * as THREE from '/vendor/three.module.js';
 
 // ---------------------------------------------------------------------------
 // Config & state
+//
+// All voxel sizes are integers measured in millimetres. The base terrain
+// grid is made of default 1000 mm voxels; smaller voxels (down to 10 mm =
+// 1 cm) live in a sparse per-chunk overlay. Mining a voxel with a smaller
+// tool size carves it: the voxel is decomposed into the largest aligned
+// sub-voxels that fill the remainder — i.e. voxels comprised of smaller
+// voxels.
 // ---------------------------------------------------------------------------
 const LOAD_RADIUS = 3;          // chunks around the player to load
 const UNLOAD_RADIUS = LOAD_RADIUS + 2;
-const REACH = 8;                // block interaction distance
+const REACH = 8;                // block interaction distance (metres)
 const FLY_SPEED = 12;
 const SPRINT_MULT = 2.6;
+const MM = 1000;                // mm per metre / per base grid cell
 
 let CX = 16, CY = 64, CZ = 16;  // chunk dimensions (from backend config)
 
@@ -15,18 +23,22 @@ const state = {
   config: null,
   materials: [],                // by id (index 0 unused)
   scene: null,                  // active scene meta
-  chunks: new Map(),            // "cx,cz" -> {cx, cz, data:Uint16Array, mesh}
+  chunks: new Map(),            // "cx,cz" -> {cx, cz, data, sub:Map, mesh}
   pending: new Set(),           // chunk keys being fetched
   inventory: new Map(),         // matId -> stored count
   hotbar: [],                   // [{matId}]
   activeSlot: 0,
+  sizesMm: [1000, 500, 100, 50, 10],  // integer mm, from backend config
+  sizeIdx: 0,                   // selected placement/mining voxel size
   yaw: 0, pitch: 0,
   pos: new THREE.Vector3(),
   keys: new Set(),
   pointerLocked: false,
   started: false,
-  target: null,                 // {hit:{x,y,z}, prev:{x,y,z}, matId}
+  target: null,                 // result of raycastVoxel()
 };
+
+const toolSizeMm = () => state.sizesMm[state.sizeIdx];
 
 // ---------------------------------------------------------------------------
 // Three.js setup
@@ -41,18 +53,17 @@ scene3.background = new THREE.Color(0x87b5e0);
 scene3.fog = new THREE.Fog(0x87b5e0, 40, 120);
 
 const camera = new THREE.PerspectiveCamera(
-  75, window.innerWidth / window.innerHeight, 0.1, 600);
+  75, window.innerWidth / window.innerHeight, 0.05, 600);
 
 const sun = new THREE.DirectionalLight(0xffffff, 2.2);
 sun.position.set(0.45, 1, 0.3);
 scene3.add(sun);
 scene3.add(new THREE.AmbientLight(0xbfd4ea, 0.9));
-const hemi = new THREE.HemisphereLight(0xcfe5ff, 0x6b6252, 0.5);
-scene3.add(hemi);
+scene3.add(new THREE.HemisphereLight(0xcfe5ff, 0x6b6252, 0.5));
 
 const chunkMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
 
-// Highlight wireframe for the targeted block
+// Highlight wireframe for the targeted voxel (unit cube, scaled per target)
 const highlight = new THREE.LineSegments(
   new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 1.002)),
   new THREE.LineBasicMaterial({ color: 0x111111 }));
@@ -66,16 +77,22 @@ window.addEventListener('resize', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Voxel access
+// Voxel access (base grid: 1000 mm cells addressed in cell units)
 // ---------------------------------------------------------------------------
 const chunkKey = (cx, cz) => `${cx},${cz}`;
+const subKey = (x, y, z, s) => `${x},${y},${z},${s}`;
+
+function chunkAtCell(wx, wz) {
+  return state.chunks.get(
+    chunkKey(Math.floor(wx / CX), Math.floor(wz / CZ)));
+}
 
 function getVoxel(wx, wy, wz) {
   if (wy < 0 || wy >= CY) return 0;
-  const cx = Math.floor(wx / CX), cz = Math.floor(wz / CZ);
-  const chunk = state.chunks.get(chunkKey(cx, cz));
+  const chunk = chunkAtCell(wx, wz);
   if (!chunk || !chunk.data) return 0;
-  const lx = wx - cx * CX, lz = wz - cz * CZ;
+  const lx = wx - Math.floor(wx / CX) * CX;
+  const lz = wz - Math.floor(wz / CZ) * CZ;
   return chunk.data[lx + lz * CX + wy * CX * CZ];
 }
 
@@ -92,7 +109,25 @@ function setVoxel(wx, wy, wz, matId) {
   if (lx === CX - 1) rebuildChunkAt(cx + 1, cz);
   if (lz === 0) rebuildChunkAt(cx, cz - 1);
   if (lz === CZ - 1) rebuildChunkAt(cx, cz + 1);
-  pushEdit(wx, wy, wz, matId);
+  pushEdit({ op: 'set', x: wx, y: wy, z: wz, id: matId });
+  return true;
+}
+
+// Sub-voxels: sparse, keyed by mm-aligned origin + size. `rebuild` lets
+// callers batch many changes into one mesh rebuild.
+function chunkAtMm(xMm, zMm) {
+  return state.chunks.get(chunkKey(
+    Math.floor(xMm / (CX * MM)), Math.floor(zMm / (CZ * MM))));
+}
+
+function setSubVoxel(xMm, yMm, zMm, sizeMm, matId, rebuild = true) {
+  const chunk = chunkAtMm(xMm, zMm);
+  if (!chunk) return false;
+  const key = subKey(xMm, yMm, zMm, sizeMm);
+  if (matId === 0) chunk.sub.delete(key);
+  else chunk.sub.set(key, { x: xMm, y: yMm, z: zMm, s: sizeMm, mat: matId });
+  pushEdit({ op: 'sub', x: xMm, y: yMm, z: zMm, s: sizeMm, id: matId });
+  if (rebuild) rebuildChunk(chunk);
   return true;
 }
 
@@ -102,8 +137,36 @@ function rebuildChunkAt(cx, cz) {
 }
 
 // ---------------------------------------------------------------------------
-// Meshing: culled cube faces, vertex-coloured per material with a subtle
-// per-voxel brightness jitter (this is what makes granite look speckled).
+// Voxel decomposition ("comprised of smaller voxels")
+//
+// Removing a small region from a bigger voxel decomposes the remainder into
+// the largest aligned voxels possible, following the size chain
+// 1000 -> 500 -> 100 -> 50 -> 10 mm (each divides the previous).
+// ---------------------------------------------------------------------------
+function decompose(ox, oy, oz, size, tx, ty, tz, ts, out) {
+  if (size === ts) return; // this is exactly the removed cell
+  const next = state.sizesMm[state.sizesMm.indexOf(size) + 1];
+  const n = size / next;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      for (let k = 0; k < n; k++) {
+        const x0 = ox + i * next, y0 = oy + j * next, z0 = oz + k * next;
+        if (tx >= x0 && tx < x0 + next &&
+            ty >= y0 && ty < y0 + next &&
+            tz >= z0 && tz < z0 + next) {
+          decompose(x0, y0, z0, next, tx, ty, tz, ts, out);
+        } else {
+          out.push([x0, y0, z0, next]);
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Meshing: culled cube faces for the base grid plus boxes for sub-voxels,
+// vertex-coloured per material with a per-voxel brightness jitter (this is
+// what makes granite look speckled).
 // ---------------------------------------------------------------------------
 const FACES = [
   { dir: [1, 0, 0], corners: [[1,1,1],[1,0,1],[1,1,0],[1,0,0]], shade: 0.80 },
@@ -139,32 +202,42 @@ function rebuildChunk(chunk) {
   const ox = chunk.cx * CX, oz = chunk.cz * CZ;
   const layer = CX * CZ;
 
+  const emitBox = (bx, by, bz, size, matId, jitter, cullFn) => {
+    const rgb = materialRGB(matId);
+    for (const face of FACES) {
+      if (cullFn && cullFn(face)) continue;
+      const base = positions.length / 3;
+      for (const c of face.corners) {
+        positions.push(bx + c[0] * size, by + c[1] * size, bz + c[2] * size);
+        normals.push(...face.dir);
+        const s = face.shade * jitter;
+        colors.push(
+          Math.min(1, rgb[0] * s),
+          Math.min(1, rgb[1] * s),
+          Math.min(1, rgb[2] * s));
+      }
+      indices.push(base, base + 1, base + 2, base + 2, base + 1, base + 3);
+    }
+  };
+
+  // Base grid: full 1000 mm voxels with neighbour face culling.
   for (let y = 0; y < CY; y++) {
     for (let z = 0; z < CZ; z++) {
       for (let x = 0; x < CX; x++) {
         const matId = chunk.data[x + z * CX + y * layer];
         if (!matId) continue;
         const wx = ox + x, wz = oz + z;
-        const jitter = voxelJitter(wx, y, wz);
-        const rgb = materialRGB(matId);
-        for (const face of FACES) {
-          const nx = wx + face.dir[0], ny = y + face.dir[1],
-                nz = wz + face.dir[2];
-          if (getVoxel(nx, ny, nz)) continue; // neighbour solid -> cull
-          const base = positions.length / 3;
-          for (const c of face.corners) {
-            positions.push(wx + c[0], y + c[1], wz + c[2]);
-            normals.push(...face.dir);
-            const s = face.shade * jitter;
-            colors.push(
-              Math.min(1, rgb[0] * s),
-              Math.min(1, rgb[1] * s),
-              Math.min(1, rgb[2] * s));
-          }
-          indices.push(base, base + 1, base + 2, base + 2, base + 1, base + 3);
-        }
+        emitBox(wx, y, wz, 1, matId, voxelJitter(wx, y, wz),
+          (face) => getVoxel(wx + face.dir[0], y + face.dir[1],
+                             wz + face.dir[2]) !== 0);
       }
     }
+  }
+
+  // Sub-voxel overlay: smaller variable-size voxels (positions in mm).
+  for (const sv of chunk.sub.values()) {
+    emitBox(sv.x / MM, sv.y / MM, sv.z / MM, sv.s / MM, sv.mat,
+      voxelJitter(sv.x / 10 | 0, sv.y / 10 | 0, sv.z / 10 | 0), null);
   }
 
   if (chunk.mesh) {
@@ -206,7 +279,11 @@ async function fetchChunk(cx, cz) {
     if (!res.ok) throw new Error(`chunk ${key}: HTTP ${res.status}`);
     const payload = await res.json();
     if (payload.scene !== state.scene.name) return; // scene switched mid-fetch
-    const chunk = { cx, cz, data: decodeVoxels(payload.voxels), mesh: null };
+    const sub = new Map();
+    for (const [x, y, z, s, mat] of payload.subvoxels || []) {
+      sub.set(subKey(x, y, z, s), { x, y, z, s, mat });
+    }
+    const chunk = { cx, cz, data: decodeVoxels(payload.voxels), sub, mesh: null };
     state.chunks.set(key, chunk);
     rebuildChunk(chunk);
     // Refresh neighbours so their border faces get culled/created correctly.
@@ -258,13 +335,14 @@ function updateChunks() {
 }
 
 // ---------------------------------------------------------------------------
-// Edit sync back to the backend (batched)
+// Edit sync back to the backend (batched); the backend persists to disk so
+// world changes survive server restarts.
 // ---------------------------------------------------------------------------
 let editQueue = [];
 let editTimer = null;
 
-function pushEdit(x, y, z, id) {
-  editQueue.push({ x, y, z, id });
+function pushEdit(edit) {
+  editQueue.push(edit);
   if (!editTimer) {
     editTimer = setTimeout(async () => {
       const edits = editQueue;
@@ -284,43 +362,113 @@ function pushEdit(x, y, z, id) {
 }
 
 // ---------------------------------------------------------------------------
-// Block targeting: Amanatides & Woo voxel traversal from the camera
+// Block targeting.
+// Base grid: Amanatides & Woo traversal. Sub-voxels: ray/AABB tests over the
+// sparse overlay of nearby chunks. The nearer hit wins.
+// Returns {kind, t, matId, normal, point, base?, sub?, sizeMm, boxMin, boxSize}
 // ---------------------------------------------------------------------------
+function rayBox(o, d, minV, maxV) {
+  let tmin = -Infinity, tmax = Infinity, axis = -1, sign = 1;
+  const axes = ['x', 'y', 'z'];
+  for (let i = 0; i < 3; i++) {
+    const a = axes[i];
+    const inv = 1 / (d[a] || 1e-12);
+    let t0 = (minV[a] - o[a]) * inv;
+    let t1 = (maxV[a] - o[a]) * inv;
+    let sgn = d[a] > 0 ? -1 : 1;   // normal of the entry face
+    if (t0 > t1) { const tt = t0; t0 = t1; t1 = tt; }
+    if (t0 > tmin) { tmin = t0; axis = i; sign = sgn; }
+    if (t1 < tmax) tmax = t1;
+    if (tmin > tmax) return null;
+  }
+  if (tmin < 0 || axis < 0) return null;
+  const normal = { x: 0, y: 0, z: 0 };
+  normal[axes[axis]] = sign;
+  return { t: tmin, normal };
+}
+
 function raycastVoxel() {
   const dir = new THREE.Vector3();
   camera.getWorldDirection(dir);
-  const origin = camera.position;
+  const o = camera.position;
 
-  let x = Math.floor(origin.x), y = Math.floor(origin.y),
-      z = Math.floor(origin.z);
-  const stepX = Math.sign(dir.x) || 1, stepY = Math.sign(dir.y) || 1,
-        stepZ = Math.sign(dir.z) || 1;
-  const tDeltaX = Math.abs(1 / (dir.x || 1e-10));
-  const tDeltaY = Math.abs(1 / (dir.y || 1e-10));
-  const tDeltaZ = Math.abs(1 / (dir.z || 1e-10));
-  let tMaxX = tDeltaX * (stepX > 0 ? (x + 1 - origin.x) : (origin.x - x));
-  let tMaxY = tDeltaY * (stepY > 0 ? (y + 1 - origin.y) : (origin.y - y));
-  let tMaxZ = tDeltaZ * (stepZ > 0 ? (z + 1 - origin.z) : (origin.z - z));
-
-  let prev = { x, y, z };
-  let t = 0;
-  while (t <= REACH) {
-    const matId = getVoxel(x, y, z);
-    if (matId) return { hit: { x, y, z }, prev, matId };
-    prev = { x, y, z };
-    if (tMaxX < tMaxY && tMaxX < tMaxZ) {
-      t = tMaxX; tMaxX += tDeltaX; x += stepX;
-    } else if (tMaxY < tMaxZ) {
-      t = tMaxY; tMaxY += tDeltaY; y += stepY;
-    } else {
-      t = tMaxZ; tMaxZ += tDeltaZ; z += stepZ;
+  // --- base grid DDA ---
+  let baseHit = null;
+  {
+    let x = Math.floor(o.x), y = Math.floor(o.y), z = Math.floor(o.z);
+    const stepX = Math.sign(dir.x) || 1, stepY = Math.sign(dir.y) || 1,
+          stepZ = Math.sign(dir.z) || 1;
+    const tDeltaX = Math.abs(1 / (dir.x || 1e-10));
+    const tDeltaY = Math.abs(1 / (dir.y || 1e-10));
+    const tDeltaZ = Math.abs(1 / (dir.z || 1e-10));
+    let tMaxX = tDeltaX * (stepX > 0 ? (x + 1 - o.x) : (o.x - x));
+    let tMaxY = tDeltaY * (stepY > 0 ? (y + 1 - o.y) : (o.y - y));
+    let tMaxZ = tDeltaZ * (stepZ > 0 ? (z + 1 - o.z) : (o.z - z));
+    let tEntry = 0;
+    let normal = { x: 0, y: 1, z: 0 };
+    while (tEntry <= REACH) {
+      const matId = getVoxel(x, y, z);
+      if (matId) {
+        baseHit = { t: tEntry, cell: { x, y, z }, matId, normal };
+        break;
+      }
+      if (tMaxX < tMaxY && tMaxX < tMaxZ) {
+        tEntry = tMaxX; tMaxX += tDeltaX; x += stepX;
+        normal = { x: -stepX, y: 0, z: 0 };
+      } else if (tMaxY < tMaxZ) {
+        tEntry = tMaxY; tMaxY += tDeltaY; y += stepY;
+        normal = { x: 0, y: -stepY, z: 0 };
+      } else {
+        tEntry = tMaxZ; tMaxZ += tDeltaZ; z += stepZ;
+        normal = { x: 0, y: 0, z: -stepZ };
+      }
     }
   }
-  return null;
+
+  // --- sub-voxel overlay ---
+  let subHit = null;
+  const c0x = Math.floor((o.x - REACH) / CX), c1x = Math.floor((o.x + REACH) / CX);
+  const c0z = Math.floor((o.z - REACH) / CZ), c1z = Math.floor((o.z + REACH) / CZ);
+  for (let cz = c0z; cz <= c1z; cz++) {
+    for (let cx = c0x; cx <= c1x; cx++) {
+      const chunk = state.chunks.get(chunkKey(cx, cz));
+      if (!chunk || chunk.sub.size === 0) continue;
+      for (const sv of chunk.sub.values()) {
+        const minV = { x: sv.x / MM, y: sv.y / MM, z: sv.z / MM };
+        const maxV = { x: (sv.x + sv.s) / MM, y: (sv.y + sv.s) / MM,
+                       z: (sv.z + sv.s) / MM };
+        const hit = rayBox(o, dir, minV, maxV);
+        if (hit && hit.t <= REACH && (!subHit || hit.t < subHit.t)) {
+          subHit = { t: hit.t, sv, normal: hit.normal };
+        }
+      }
+    }
+  }
+
+  const useSub = subHit && (!baseHit || subHit.t < baseHit.t);
+  if (!useSub && !baseHit) return null;
+
+  const t = useSub ? subHit.t : baseHit.t;
+  const point = o.clone().addScaledVector(dir, t);
+  if (useSub) {
+    const sv = subHit.sv;
+    return {
+      kind: 'sub', t, point, matId: sv.mat, normal: subHit.normal,
+      sub: sv, sizeMm: sv.s,
+      boxMin: new THREE.Vector3(sv.x / MM, sv.y / MM, sv.z / MM),
+      boxSize: sv.s / MM,
+    };
+  }
+  const c = baseHit.cell;
+  return {
+    kind: 'base', t, point, matId: baseHit.matId, normal: baseHit.normal,
+    base: c, sizeMm: MM,
+    boxMin: new THREE.Vector3(c.x, c.y, c.z), boxSize: 1,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Inventory / hotbar
+// Inventory (the "store" part of create/destroy/store)
 // ---------------------------------------------------------------------------
 function storedCount(matId) {
   return state.inventory.get(matId) || 0;
@@ -337,25 +485,121 @@ function consumeBlock(matId) {
   renderHotbar();
 }
 
+// ---------------------------------------------------------------------------
+// Create / destroy / carve
+// ---------------------------------------------------------------------------
+const floorTo = (vMm, sMm) => Math.floor(vMm / sMm) * sMm;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// Pick the tool-size cell inside the target voxel nearest the hit point.
+function innerCell(target, tool) {
+  const eps = 0.5; // half a millimetre inside the surface
+  const px = target.point.x * MM - target.normal.x * eps;
+  const py = target.point.y * MM - target.normal.y * eps;
+  const pz = target.point.z * MM - target.normal.z * eps;
+  const o = target.kind === 'sub'
+    ? { x: target.sub.x, y: target.sub.y, z: target.sub.z }
+    : { x: target.base.x * MM, y: target.base.y * MM, z: target.base.z * MM };
+  const size = target.sizeMm;
+  return {
+    x: clamp(floorTo(px, tool), o.x, o.x + size - tool),
+    y: clamp(floorTo(py, tool), o.y, o.y + size - tool),
+    z: clamp(floorTo(pz, tool), o.z, o.z + size - tool),
+  };
+}
+
 function destroyBlock() {
   const t = state.target;
   if (!t) return;
+  const tool = toolSizeMm();
+
+  if (t.kind === 'base' && tool === MM) {
+    // Remove a whole default-size voxel.
+    storeBlock(t.matId);
+    setVoxel(t.base.x, t.base.y, t.base.z, 0);
+    return;
+  }
+
+  if (t.kind === 'sub' && tool >= t.sub.s) {
+    // Tool is at least as big as the voxel: remove it whole.
+    storeBlock(t.matId);
+    setSubVoxel(t.sub.x, t.sub.y, t.sub.z, t.sub.s, 0);
+    return;
+  }
+
+  // Carve: remove a tool-sized piece out of a bigger voxel and decompose
+  // the remainder into smaller voxels of the same material.
+  const cell = innerCell(t, tool);
+  const remainder = [];
+  if (t.kind === 'base') {
+    const ox = t.base.x * MM, oy = t.base.y * MM, oz = t.base.z * MM;
+    decompose(ox, oy, oz, MM, cell.x, cell.y, cell.z, tool, remainder);
+  } else {
+    decompose(t.sub.x, t.sub.y, t.sub.z, t.sub.s,
+              cell.x, cell.y, cell.z, tool, remainder);
+    setSubVoxel(t.sub.x, t.sub.y, t.sub.z, t.sub.s, 0, false);
+  }
+  for (const [x, y, z, s] of remainder) {
+    setSubVoxel(x, y, z, s, t.matId, false);
+  }
+  if (t.kind === 'base') {
+    // setVoxel rebuilds the chunk, which also picks up the new sub-voxels.
+    setVoxel(t.base.x, t.base.y, t.base.z, 0);
+  } else {
+    const chunk = chunkAtMm(t.sub.x, t.sub.z);
+    if (chunk) rebuildChunk(chunk);
+  }
   storeBlock(t.matId);
-  setVoxel(t.hit.x, t.hit.y, t.hit.z, 0);
+}
+
+function subOverlaps(xMm, yMm, zMm, sMm) {
+  const chunk = chunkAtMm(xMm, zMm);
+  if (!chunk) return false;
+  for (const sv of chunk.sub.values()) {
+    if (xMm < sv.x + sv.s && xMm + sMm > sv.x &&
+        yMm < sv.y + sv.s && yMm + sMm > sv.y &&
+        zMm < sv.z + sv.s && zMm + sMm > sv.z) return true;
+  }
+  return false;
+}
+
+function cellHasSubs(cellX, cellY, cellZ) {
+  return subOverlaps(cellX * MM, cellY * MM, cellZ * MM, MM);
 }
 
 function placeBlock() {
   const t = state.target;
   if (!t) return;
-  const { x, y, z } = t.prev;
-  if (getVoxel(x, y, z)) return;
-  // Don't place a block into the camera's own cell.
-  const cam = camera.position;
-  if (Math.floor(cam.x) === x && Math.floor(cam.z) === z &&
-      (Math.floor(cam.y) === y || Math.floor(cam.y) - 1 === y)) return;
+  const tool = toolSizeMm();
   const matId = state.hotbar[state.activeSlot].matId;
   if (!matId) return;
-  if (setVoxel(x, y, z, matId)) consumeBlock(matId);
+
+  // Point just outside the hit surface, in mm.
+  const eps = 0.5;
+  const px = t.point.x * MM + t.normal.x * eps;
+  const py = t.point.y * MM + t.normal.y * eps;
+  const pz = t.point.z * MM + t.normal.z * eps;
+
+  if (tool === MM) {
+    // Full default-size voxel on the base grid.
+    const x = Math.floor(px / MM), y = Math.floor(py / MM),
+          z = Math.floor(pz / MM);
+    if (getVoxel(x, y, z) || cellHasSubs(x, y, z)) return;
+    const cam = camera.position;
+    if (Math.floor(cam.x) === x && Math.floor(cam.z) === z &&
+        (Math.floor(cam.y) === y || Math.floor(cam.y) - 1 === y)) return;
+    if (setVoxel(x, y, z, matId)) consumeBlock(matId);
+    return;
+  }
+
+  // Smaller voxel, aligned to its own mm grid.
+  const x = floorTo(px, tool), y = floorTo(py, tool), z = floorTo(pz, tool);
+  if (y < 0 || y >= CY * MM) return;
+  const cellX = Math.floor(x / MM), cellY = Math.floor(y / MM),
+        cellZ = Math.floor(z / MM);
+  if (getVoxel(cellX, cellY, cellZ)) return;  // inside a solid voxel
+  if (subOverlaps(x, y, z, tool)) return;     // overlaps another sub-voxel
+  if (setSubVoxel(x, y, z, tool, matId)) consumeBlock(matId);
 }
 
 function pickBlock() {
@@ -365,6 +609,12 @@ function pickBlock() {
   renderHotbar();
 }
 
+function cycleVoxelSize(delta) {
+  const n = state.sizesMm.length;
+  state.sizeIdx = (state.sizeIdx + delta + n) % n;
+  renderSizeInfo();
+}
+
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
@@ -372,12 +622,9 @@ const el = (id) => document.getElementById(id);
 const hotbarEl = el('hotbar');
 const sceneInfoEl = el('scene-info');
 const targetInfoEl = el('target-info');
+const sizeInfoEl = el('size-info');
 const matModal = el('mat-modal');
 const invModal = el('inv-modal');
-
-function matName(matId) {
-  return state.materials[matId] ? state.materials[matId].name : '—';
-}
 
 function renderHotbar() {
   hotbarEl.innerHTML = '';
@@ -394,6 +641,14 @@ function renderHotbar() {
     div.addEventListener('click', () => { state.activeSlot = i; renderHotbar(); });
     hotbarEl.appendChild(div);
   });
+}
+
+function renderSizeInfo() {
+  const s = toolSizeMm();
+  sizeInfoEl.innerHTML =
+    `Voxel size: <b>${s} mm</b> ` +
+    `<span class="muted">(G / V to change · min ${state.sizesMm[state.sizesMm.length - 1]} mm · ` +
+    `smaller sizes carve big voxels into smaller ones)</span>`;
 }
 
 function renderSceneInfo() {
@@ -421,9 +676,12 @@ function renderTargetInfo() {
   const t = state.target;
   if (t) {
     const m = state.materials[t.matId];
+    const where = t.kind === 'base'
+      ? `(${t.base.x}, ${t.base.y}, ${t.base.z})`
+      : `(${t.sub.x}, ${t.sub.y}, ${t.sub.z}) mm`;
     targetInfoEl.innerHTML =
       `Looking at: <b>${m ? m.name : '?'}</b> ` +
-      `<span class="muted">(${t.hit.x}, ${t.hit.y}, ${t.hit.z}) · ` +
+      `<span class="muted">${t.sizeMm} mm voxel · ${where} · ` +
       `${m ? m.category : ''}</span>`;
   } else {
     targetInfoEl.innerHTML = '<span class="muted">No block in reach</span>';
@@ -512,6 +770,9 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   if (anyModalOpen()) return;
+
+  if (e.code === 'KeyG') cycleVoxelSize(1);   // smaller
+  if (e.code === 'KeyV') cycleVoxelSize(-1);  // bigger
 
   if (e.code.startsWith('Digit')) {
     const n = parseInt(e.code.slice(5), 10);
@@ -605,8 +866,12 @@ function animate() {
 
     state.target = raycastVoxel();
     if (state.target) {
-      const { x, y, z } = state.target.hit;
-      highlight.position.set(x + 0.5, y + 0.5, z + 0.5);
+      const t = state.target;
+      highlight.position.set(
+        t.boxMin.x + t.boxSize / 2,
+        t.boxMin.y + t.boxSize / 2,
+        t.boxMin.z + t.boxSize / 2);
+      highlight.scale.setScalar(t.boxSize);
       highlight.visible = true;
     } else {
       highlight.visible = false;
@@ -637,6 +902,7 @@ function activateScene(meta) {
   state.pos.set(meta.spawn[0], meta.spawn[1], meta.spawn[2]);
   [state.yaw, state.pitch] = meta.look || [Math.PI * 0.25, -0.25];
   renderSceneInfo();
+  renderSizeInfo();
   updateChunks();
 }
 
@@ -663,6 +929,11 @@ async function boot() {
   }
 
   [CX, CY, CZ] = state.config.chunkSize;
+  if (state.config.voxelSizesMm) {
+    state.sizesMm = state.config.voxelSizesMm.map((s) => s | 0);
+    state.sizeIdx = Math.max(
+      0, state.sizesMm.indexOf(state.config.defaultVoxelSizeMm | 0));
+  }
   state.materials = [];
   for (const m of state.config.materials) state.materials[m.id] = m;
 
@@ -674,10 +945,6 @@ async function boot() {
     if (s.name === state.config.defaultScene) opt.selected = true;
     select.appendChild(opt);
   }
-  select.addEventListener('change', () => {
-    const meta = state.config.scenes.find((s) => s.name === select.value);
-    if (meta && state.started) activateScene(meta);
-  });
 
   defaultHotbar();
   statusEl.hidden = true;
@@ -701,6 +968,7 @@ animate();
 
 // Debug/testing hook (also handy in the browser console).
 window.__voxel = {
-  state, getVoxel, setVoxel, destroyBlock, placeBlock, pickBlock,
-  raycastVoxel, storedCount,
+  state, getVoxel, setVoxel, setSubVoxel, destroyBlock, placeBlock,
+  pickBlock, raycastVoxel, storedCount, cycleVoxelSize, decompose,
+  toolSizeMm,
 };

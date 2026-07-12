@@ -20,16 +20,54 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from materials import MATERIALS
-from worldgen import build_scenes, DEFAULT_SCENE, CHUNK_X, CHUNK_Y, CHUNK_Z
+from worldgen import (build_scenes, DEFAULT_SCENE, CHUNK_X, CHUNK_Y, CHUNK_Z,
+                      VOXEL_SIZE_MM, MIN_VOXEL_SIZE_MM, VOXEL_SIZES_MM)
 
 STATIC_DIR = Path(__file__).parent / "static"
+STATE_FILE = Path(__file__).parent / "world_state.json"
 
 SCENES = build_scenes(len(MATERIALS))
 
-# In-memory edit store: {scene: {(x, y, z): material_id}}. Edits are applied on
-# top of generated chunks, so a reloaded page sees the same modified world.
+# Edit stores, applied on top of generated chunks and persisted to
+# STATE_FILE so world changes survive server restarts.
+#   EDITS:     {scene: {(x, y, z): material_id}}          base 1000 mm grid
+#   SUBVOXELS: {scene: {(x_mm, y_mm, z_mm, size_mm): id}}  smaller voxels
 EDITS = {name: {} for name in SCENES}
+SUBVOXELS = {name: {} for name in SCENES}
 EDITS_LOCK = threading.Lock()
+
+SUB_SIZES = [s for s in VOXEL_SIZES_MM if s < VOXEL_SIZE_MM]
+
+
+def load_state():
+    if not STATE_FILE.is_file():
+        return
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as err:
+        print(f"warning: could not load {STATE_FILE.name}: {err}")
+        return
+    for scene, stores in data.get("scenes", {}).items():
+        if scene not in SCENES:
+            continue
+        EDITS[scene] = {
+            (int(x), int(y), int(z)): int(m)
+            for x, y, z, m in stores.get("base", [])}
+        SUBVOXELS[scene] = {
+            (int(x), int(y), int(z), int(s)): int(m)
+            for x, y, z, s, m in stores.get("sub", [])}
+
+
+def save_state():
+    with EDITS_LOCK:
+        data = {"scenes": {name: {
+            "base": [[x, y, z, m] for (x, y, z), m in EDITS[name].items()],
+            "sub": [[x, y, z, s, m]
+                    for (x, y, z, s), m in SUBVOXELS[name].items()],
+        } for name in SCENES}}
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(STATE_FILE)
 
 CHUNK_CACHE = {}
 CHUNK_CACHE_LOCK = threading.Lock()
@@ -109,6 +147,9 @@ class Handler(BaseHTTPRequestHandler):
             "scenes": [s.meta() for s in SCENES.values()],
             "defaultScene": DEFAULT_SCENE,
             "chunkSize": [CHUNK_X, CHUNK_Y, CHUNK_Z],
+            "voxelSizesMm": VOXEL_SIZES_MM,
+            "defaultVoxelSizeMm": VOXEL_SIZE_MM,
+            "minVoxelSizeMm": MIN_VOXEL_SIZE_MM,
         })
 
     def handle_chunk(self, query):
@@ -125,6 +166,14 @@ class Handler(BaseHTTPRequestHandler):
 
         voxels = get_chunk_voxels(scene, cx, cz)
         packed = struct.pack(f"<{len(voxels)}H", *voxels)
+
+        x0, x1 = cx * CHUNK_X * 1000, (cx + 1) * CHUNK_X * 1000
+        z0, z1 = cz * CHUNK_Z * 1000, (cz + 1) * CHUNK_Z * 1000
+        with EDITS_LOCK:
+            subs = [[x, y, z, s, m]
+                    for (x, y, z, s), m in SUBVOXELS[scene].items()
+                    if x0 <= x < x1 and z0 <= z < z1]
+
         self.send_json({
             "scene": scene,
             "cx": cx,
@@ -132,6 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             "size": [CHUNK_X, CHUNK_Y, CHUNK_Z],
             "encoding": "base64-uint16-le",
             "voxels": base64.b64encode(packed).decode("ascii"),
+            "subvoxels": subs,  # [x_mm, y_mm, z_mm, size_mm, material_id]
         })
 
     def handle_edits(self):
@@ -149,16 +199,40 @@ class Handler(BaseHTTPRequestHandler):
         max_id = len(MATERIALS)
         with EDITS_LOCK:
             store = EDITS[scene]
-            for e in edits[:4096]:
+            substore = SUBVOXELS[scene]
+            for e in edits[:8192]:
                 try:
-                    x, y, z = int(e["x"]), int(e["y"]), int(e["z"])
+                    op = e.get("op", "set")
                     mat = int(e["id"])
-                except (KeyError, TypeError, ValueError):
+                    if not 0 <= mat <= max_id:
+                        continue
+                    if op == "set":
+                        # Full default-size (1000 mm) voxel on the base grid.
+                        x, y, z = int(e["x"]), int(e["y"]), int(e["z"])
+                        if not 0 <= y < CHUNK_Y:
+                            continue
+                        store[(x, y, z)] = mat
+                        applied += 1
+                    elif op == "sub":
+                        # Smaller voxel; coordinates and size in integer mm.
+                        x, y, z = int(e["x"]), int(e["y"]), int(e["z"])
+                        s = int(e["s"])
+                        if s not in SUB_SIZES:
+                            continue
+                        if x % s or y % s or z % s:
+                            continue
+                        if not 0 <= y < CHUNK_Y * 1000:
+                            continue
+                        key = (x, y, z, s)
+                        if mat == 0:
+                            substore.pop(key, None)
+                        else:
+                            substore[key] = mat
+                        applied += 1
+                except (KeyError, TypeError, ValueError, AttributeError):
                     continue
-                if not (0 <= y < CHUNK_Y and 0 <= mat <= max_id):
-                    continue
-                store[(x, y, z)] = mat
-                applied += 1
+        if applied:
+            save_state()
         self.send_json({"ok": True, "applied": applied})
 
     # ---- static files ----
@@ -184,9 +258,11 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
 
+    load_state()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Voxel world backend: http://{args.host}:{args.port}")
     print(f"  materials: {len(MATERIALS)}   scenes: {', '.join(SCENES)}")
+    print(f"  world state file: {STATE_FILE}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
