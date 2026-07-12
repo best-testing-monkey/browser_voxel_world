@@ -86,9 +86,46 @@ class Scene:
         self.description = description
         self.spawn = spawn  # [x, y, z]
         self.look = look    # (yaw, pitch) radians
+        # Backend-placed blocks layered over generated terrain (screens,
+        # sensors, ...): {(x, y, z): material_id}
+        self.fixtures = {}
+        # Display surfaces the backend can draw markdown/SVG on:
+        # {id: {origin, facing, w, h, content, version}}
+        self.screens = {}
+        # Named points of interest (e.g. sensor positions), for the client
+        # and for tests: {name: [x, y, z]}
+        self.pois = {}
 
     def generate_chunk(self, cx, cz):
         raise NotImplementedError
+
+    def add_screen(self, sid, origin, facing, w, h, ctype, data,
+                   screen_material_id=None):
+        """Declare a screen surface of w x h blocks. `facing` is one of
+        +z/-z/+x/-x. The screen's voxels are added as fixtures so the panel
+        physically exists in the world."""
+        self.screens[sid] = {
+            "id": sid,
+            "origin": list(origin),
+            "facing": facing,
+            "w": w,
+            "h": h,
+            "content": {"type": ctype, "data": data},
+            "version": 1,
+        }
+        mat = screen_material_id or NAME_TO_ID["Screen"]
+        x0, y0, z0 = origin
+        for i in range(w):
+            for j in range(h):
+                if facing in ("+z", "-z"):
+                    self.fixtures[(x0 + i, y0 + j, z0)] = mat
+                else:
+                    self.fixtures[(x0, y0 + j, z0 + i)] = mat
+
+    def set_screen_content(self, sid, ctype, data):
+        screen = self.screens[sid]
+        screen["content"] = {"type": ctype, "data": data}
+        screen["version"] += 1
 
     def meta(self):
         return {
@@ -98,7 +135,48 @@ class Scene:
             "spawn": self.spawn,
             "look": list(self.look),
             "chunkSize": [CHUNK_X, CHUNK_Y, CHUNK_Z],
+            "pois": self.pois,
         }
+
+
+DEMO_MARKDOWN = """# Sensor Board
+
+This screen is rendered from **Markdown** sent by the *Python backend*.
+
+- `Touch Sensor` (red): right-click it
+- `Light Sensor` (yellow): look at it
+- `Pressure Plate` (teal): hover over it
+
+> Trigger a sensor and the backend rewrites this screen.
+
+Touches: 0 · Light: 0 · Pressure: 0
+"""
+
+DEMO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="g" cx="50%" cy="42%" r="65%">
+      <stop offset="0%" stop-color="#284a75"/>
+      <stop offset="100%" stop-color="#0b1020"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#g)"/>
+  <g stroke="#7fc8ff" stroke-width="3" fill="none" opacity="0.9">
+    <circle cx="256" cy="220" r="120"/>
+    <circle cx="256" cy="220" r="84"/>
+    <circle cx="256" cy="220" r="48"/>
+  </g>
+  <g fill="#ffd94a">
+    <circle cx="256" cy="100" r="10"/>
+    <circle cx="376" cy="220" r="10"/>
+    <circle cx="256" cy="340" r="10"/>
+    <circle cx="136" cy="220" r="10"/>
+  </g>
+  <polygon points="256,180 271,225 256,270 241,225" fill="#d9484c"/>
+  <text x="256" y="420" text-anchor="middle" font-family="sans-serif"
+        font-size="34" fill="#e8eaf0">SVG from Python</text>
+  <text x="256" y="460" text-anchor="middle" font-family="sans-serif"
+        font-size="20" fill="#8b98a7">POST /api/screens to change me</text>
+</svg>"""
 
 
 class GraniteHills(Scene):
@@ -115,6 +193,62 @@ class GraniteHills(Scene):
         self.base_height = 22
         self.amplitude = 14
         self.scale = 1 / 48.0
+        self._build_demo_installation()
+
+    def _build_demo_installation(self):
+        """A screen wall plus one of each actionable sensor near spawn,
+        wired up by the backend event handler in server.py."""
+        base_y = 1 + max(self.height_at(x, z)
+                         for x in range(3, 17) for z in range(2, 10))
+
+        self.add_screen(
+            "board", (4, base_y, 3), "+z", 6, 4, "markdown", DEMO_MARKDOWN)
+        self.add_screen(
+            "art", (11, base_y, 3), "+z", 4, 4, "svg", DEMO_SVG)
+
+        touch = (5, self.height_at(5, 7) + 1, 7)
+        light = (8, self.height_at(8, 7) + 1, 7)
+        pressure = (11, self.height_at(11, 7) + 1, 7)
+        self.fixtures[touch] = NAME_TO_ID["Touch Sensor"]
+        self.fixtures[light] = NAME_TO_ID["Light Sensor"]
+        self.fixtures[pressure] = NAME_TO_ID["Pressure Plate"]
+
+        # Lamp post: light colour/strength is governed by the stained glass
+        # panes around the lamp (see the lamp handling in the client).
+        gy = self.height_at(15, 12) + 1
+        lamp = (15, gy + 2, 12)
+        self.fixtures[(15, gy, 12)] = NAME_TO_ID["Iron Block"]
+        self.fixtures[(15, gy + 1, 12)] = NAME_TO_ID["Iron Block"]
+        self.fixtures[lamp] = NAME_TO_ID["Lamp"]
+        self.fixtures[(14, gy + 2, 12)] = NAME_TO_ID["Blue Stained Glass"]
+        self.fixtures[(16, gy + 2, 12)] = NAME_TO_ID["Orange Stained Glass"]
+
+        # Fluid faucets on iron stands: sand, water and lava pour out as
+        # 5 cm fluid voxels. Water and lava are close enough to make
+        # obsidian where the streams meet; wooden planks under the lava
+        # faucet demonstrate burning.
+        faucets = [("Sand Faucet", "sand_faucet", 20),
+                   ("Water Faucet", "water_faucet", 24),
+                   ("Lava Faucet", "lava_faucet", 27)]
+        for name, key, fx in faucets:
+            fz = 8
+            fy = self.height_at(fx, fz) + 5
+            self.fixtures[(fx, fy, fz)] = NAME_TO_ID[name]
+            self.pois[key] = [fx, fy, fz]
+        wy = self.height_at(27, 8)
+        for dx in range(-1, 2):
+            for dz in range(-1, 2):
+                self.fixtures[(27 + dx, wy + 1, 8 + dz)] = \
+                    NAME_TO_ID["Oak Planks"]
+
+        self.pois.update({
+            "touch_sensor": list(touch),
+            "light_sensor": list(light),
+            "pressure_plate": list(pressure),
+            "screen_board": [4, base_y, 3],
+            "screen_art": [11, base_y, 3],
+            "lamp": list(lamp),
+        })
 
     def height_at(self, wx, wz):
         n = self.perlin.fbm(wx * self.scale, wz * self.scale, octaves=4)

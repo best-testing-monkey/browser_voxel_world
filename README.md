@@ -37,6 +37,25 @@ Open http://127.0.0.1:8000 in a browser, pick a scene, and click **Play**.
 - **Persistent world**: every edit is POSTed to the backend, which stores
   it in `world_state.json` — changes survive both page reloads *and server
   restarts*.
+- **Screen surfaces**: panels of Screen voxels the backend draws
+  **Markdown or SVG** onto (`GET/POST /api/screens`). Content is versioned;
+  browsers re-render within ~2 s of a change. The demo scene has a
+  markdown Sensor Board and an SVG art panel.
+- **Actionable materials**: the red **Touch Sensor** (right-click), yellow
+  **Light Sensor** (look at it) and teal **Pressure Plate** (hover above
+  it) POST events to the backend (`/api/events`). Poll them, receive them
+  by webhook (`/api/subscribe`), or handle them in-process — the demo
+  handler rewrites the Sensor Board and toggles indicator blocks.
+- **Lamps**: the Lamp material is a real point light; its colour and
+  strength are governed by the glass around it (stained glass tints,
+  clear glass brightens, tinted glass dims).
+- **Fluids**: Sand/Water/Lava Faucet blocks pour 5 cm fluid voxels
+  (deliberately a touch slower than the real stuff). Cross effects are
+  backend-configured: lava + water freezes to obsidian, wood burns in
+  lava, small wooden voxels float up through water, water cools magma to
+  coal — and those effects are persisted world edits.
+- **Full backend API** — see [API.md](API.md) for placing/removing voxels,
+  driving screens and subscribing to sensor events from your own code.
 - **1024+ materials** (press **E** for the searchable browser): the
   Minecraft block palette (including all 16-color dyed families), modern
   building & construction materials, crafting materials, the full periodic

@@ -396,22 +396,44 @@ def _mix(hex_color: str, factor: float) -> str:
     return "#%02x%02x%02x" % (r, g, b)
 
 
+# Interactive materials, appended after the catalog is padded so the ids of
+# all other materials stay stable. "action" marks materials that generate
+# events the backend can respond to; "screen" marks display surfaces.
+INTERACTIVE_MATERIALS = [
+    ("Screen", "#0d1016", "screen"),
+    ("Touch Sensor", "#d9484c", "touch"),
+    ("Light Sensor", "#ffd94a", "light"),
+    ("Pressure Plate", "#3fbf9f", "pressure"),
+    ("Lamp", "#fff1cf", "lamp"),
+    ("Sand Faucet", "#c8b984", "faucet"),
+    ("Water Faucet", "#4a7bd9", "faucet"),
+    ("Lava Faucet", "#e2661e", "faucet"),
+]
+
+# Wood-family names that burn in lava / float in water
+_FLAMMABLE_HINTS = ("Planks", "Log", " Wood", "Bookshelf", "Hay Bale",
+                    "Timber", "Plywood", "Lumber")
+
+
 def build_materials():
     materials = []
     seen = set()
 
-    def add(name, category, color=None):
+    def add(name, category, color=None, action=None):
         if name in seen:
             return
         seen.add(name)
         if color is None:
             color = KNOWN_COLORS.get(name) or _derive_color(name, category)
-        materials.append({
+        entry = {
             "id": len(materials) + 1,  # 0 is air
             "name": name,
             "category": category,
             "color": color,
-        })
+        }
+        if action:
+            entry["action"] = action
+        materials.append(entry)
 
     for name in MINECRAFT_BASE:
         add(name, "Minecraft")
@@ -454,6 +476,14 @@ def build_materials():
         color = "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
         add(f"Paint Swatch {swatch + 1:03d} (H{int(hue):03d})", "Paint", color)
         swatch += 1
+
+    for name, color, action in INTERACTIVE_MATERIALS:
+        add(name, "Interactive", color, action)
+
+    for m in materials:
+        if m["category"] == "Wood" or \
+                any(h in m["name"] for h in _FLAMMABLE_HINTS):
+            m["flammable"] = True
 
     assert len(materials) >= MINIMUM_MATERIALS, len(materials)
     return materials

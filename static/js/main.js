@@ -1,4 +1,6 @@
 import * as THREE from '/vendor/three.module.js';
+import { createScreenManager } from '/js/screens.js';
+import { createFluidSim } from '/js/fluids.js';
 
 // ---------------------------------------------------------------------------
 // Config & state
@@ -36,7 +38,13 @@ const state = {
   pointerLocked: false,
   started: false,
   target: null,                 // result of raycastVoxel()
+  rev: 0,                       // last world revision seen from the backend
+  lightGaze: null,              // cell key currently firing the light sensor
+  pressureCell: null,           // cell key currently holding a pressure plate
 };
+
+let screenMgr = null;           // created once config is loaded
+let fluidSim = null;
 
 const toolSizeMm = () => state.sizesMm[state.sizeIdx];
 
@@ -96,7 +104,7 @@ function getVoxel(wx, wy, wz) {
   return chunk.data[lx + lz * CX + wy * CX * CZ];
 }
 
-function setVoxel(wx, wy, wz, matId) {
+function setVoxel(wx, wy, wz, matId, sync = true) {
   if (wy < 0 || wy >= CY) return false;
   const cx = Math.floor(wx / CX), cz = Math.floor(wz / CZ);
   const chunk = state.chunks.get(chunkKey(cx, cz));
@@ -109,7 +117,7 @@ function setVoxel(wx, wy, wz, matId) {
   if (lx === CX - 1) rebuildChunkAt(cx + 1, cz);
   if (lz === 0) rebuildChunkAt(cx, cz - 1);
   if (lz === CZ - 1) rebuildChunkAt(cx, cz + 1);
-  pushEdit({ op: 'set', x: wx, y: wy, z: wz, id: matId });
+  if (sync) pushEdit({ op: 'set', x: wx, y: wy, z: wz, id: matId });
   return true;
 }
 
@@ -120,15 +128,70 @@ function chunkAtMm(xMm, zMm) {
     Math.floor(xMm / (CX * MM)), Math.floor(zMm / (CZ * MM))));
 }
 
-function setSubVoxel(xMm, yMm, zMm, sizeMm, matId, rebuild = true) {
+function setSubVoxel(xMm, yMm, zMm, sizeMm, matId, rebuild = true,
+                     sync = true) {
   const chunk = chunkAtMm(xMm, zMm);
   if (!chunk) return false;
   const key = subKey(xMm, yMm, zMm, sizeMm);
   if (matId === 0) chunk.sub.delete(key);
   else chunk.sub.set(key, { x: xMm, y: yMm, z: zMm, s: sizeMm, mat: matId });
-  pushEdit({ op: 'sub', x: xMm, y: yMm, z: zMm, s: sizeMm, id: matId });
+  if (sync) pushEdit({ op: 'sub', x: xMm, y: yMm, z: zMm, s: sizeMm, id: matId });
   if (rebuild) rebuildChunk(chunk);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// 50 mm cell queries for the fluid simulation. Chunks keep an occupancy set
+// of sub-voxel-covered cells (built during meshing) so lookups stay O(1).
+// ---------------------------------------------------------------------------
+const CELLS_PER_BLOCK = 20;    // 1000 mm / 50 mm
+const cellKey = (x, y, z) => `${x},${y},${z}`;
+
+function isSolidCell(cx, cy, cz) {
+  const bx = Math.floor(cx / CELLS_PER_BLOCK);
+  const by = Math.floor(cy / CELLS_PER_BLOCK);
+  const bz = Math.floor(cz / CELLS_PER_BLOCK);
+  if (by < 0 || by >= CY) return false;
+  if (getVoxel(bx, by, bz)) return true;
+  const chunk = chunkAtCell(bx, bz);
+  return !!(chunk && chunk.subCells && chunk.subCells.has(cellKey(cx, cy, cz)));
+}
+
+// Returns the block occupying a 50 mm cell:
+// {kind:'base', x,y,z, id} or {kind:'sub', x,y,z,s (mm), id} or null.
+function blockAtCell(cx, cy, cz) {
+  const bx = Math.floor(cx / CELLS_PER_BLOCK);
+  const by = Math.floor(cy / CELLS_PER_BLOCK);
+  const bz = Math.floor(cz / CELLS_PER_BLOCK);
+  const base = getVoxel(bx, by, bz);
+  if (base) return { kind: 'base', x: bx, y: by, z: bz, id: base };
+  const chunk = chunkAtCell(bx, bz);
+  if (!chunk || !chunk.subCells ||
+      !chunk.subCells.has(cellKey(cx, cy, cz))) return null;
+  const xMm = cx * 50, yMm = cy * 50, zMm = cz * 50;
+  for (const sv of chunk.sub.values()) {
+    if (xMm >= sv.x && xMm < sv.x + sv.s &&
+        yMm >= sv.y && yMm < sv.y + sv.s &&
+        zMm >= sv.z && zMm < sv.z + sv.s) {
+      return { kind: 'sub', x: sv.x, y: sv.y, z: sv.z, s: sv.s, id: sv.mat };
+    }
+  }
+  return null;
+}
+
+function subExactAtCell(cx, cy, cz) {
+  const chunk = chunkAtCell(Math.floor(cx / CELLS_PER_BLOCK),
+                            Math.floor(cz / CELLS_PER_BLOCK));
+  if (!chunk) return null;
+  return chunk.sub.get(subKey(cx * 50, cy * 50, cz * 50, 50)) || null;
+}
+
+function loadedFaucets() {
+  const out = [];
+  for (const chunk of state.chunks.values()) {
+    if (chunk.faucets) out.push(...chunk.faucets);
+  }
+  return out;
 }
 
 function rebuildChunkAt(cx, cz) {
@@ -220,13 +283,21 @@ function rebuildChunk(chunk) {
     }
   };
 
-  // Base grid: full 1000 mm voxels with neighbour face culling.
+  // Base grid: full 1000 mm voxels with neighbour face culling. While we
+  // scan, collect lamps and fluid faucets for the light/fluid systems.
+  chunk.lamps = [];
+  chunk.faucets = [];
   for (let y = 0; y < CY; y++) {
     for (let z = 0; z < CZ; z++) {
       for (let x = 0; x < CX; x++) {
         const matId = chunk.data[x + z * CX + y * layer];
         if (!matId) continue;
         const wx = ox + x, wz = oz + z;
+        const action = state.materials[matId] && state.materials[matId].action;
+        if (action === 'lamp') chunk.lamps.push({ x: wx, y, z: wz });
+        else if (action === 'faucet') {
+          chunk.faucets.push({ x: wx, y, z: wz, id: matId });
+        }
         emitBox(wx, y, wz, 1, matId, voxelJitter(wx, y, wz),
           (face) => getVoxel(wx + face.dir[0], y + face.dir[1],
                              wz + face.dir[2]) !== 0);
@@ -235,9 +306,20 @@ function rebuildChunk(chunk) {
   }
 
   // Sub-voxel overlay: smaller variable-size voxels (positions in mm).
+  // Also refresh the 50 mm occupancy set used by the fluid simulation.
+  chunk.subCells = new Set();
   for (const sv of chunk.sub.values()) {
     emitBox(sv.x / MM, sv.y / MM, sv.z / MM, sv.s / MM, sv.mat,
       voxelJitter(sv.x / 10 | 0, sv.y / 10 | 0, sv.z / 10 | 0), null);
+    const n = sv.s / 50;
+    const cx0 = sv.x / 50, cy0 = sv.y / 50, cz0 = sv.z / 50;
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        for (let k = 0; k < n; k++) {
+          chunk.subCells.add(cellKey(cx0 + i, cy0 + j, cz0 + k));
+        }
+      }
+    }
   }
 
   if (chunk.mesh) {
@@ -567,9 +649,25 @@ function cellHasSubs(cellX, cellY, cellZ) {
   return subOverlaps(cellX * MM, cellY * MM, cellZ * MM, MM);
 }
 
+function targetBaseCell(t) {
+  return t.kind === 'base'
+    ? t.base
+    : { x: Math.floor(t.sub.x / MM), y: Math.floor(t.sub.y / MM),
+        z: Math.floor(t.sub.z / MM) };
+}
+
 function placeBlock() {
   const t = state.target;
   if (!t) return;
+  // Right-clicking an actionable "touch" material triggers it instead of
+  // placing a block against it.
+  const tm = state.materials[t.matId];
+  if (tm && tm.action === 'touch') {
+    const c = targetBaseCell(t);
+    sendGameEvent('touch', c, 'on');
+    showToast(`Touched ${tm.name}`);
+    return;
+  }
   const tool = toolSizeMm();
   const matId = state.hotbar[state.activeSlot].matId;
   if (!matId) return;
@@ -616,6 +714,151 @@ function cycleVoxelSize(delta) {
 }
 
 // ---------------------------------------------------------------------------
+// Actionable materials: touch / light / pressure events sent to the backend
+// ---------------------------------------------------------------------------
+function sendGameEvent(action, cell, stateStr) {
+  fetch('/api/events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      scene: state.scene.name,
+      events: [{ action, x: cell.x, y: cell.y, z: cell.z, state: stateStr }],
+    }),
+  }).catch((err) => console.error('event send failed', err));
+}
+
+// Light sensor: fires while the player's view ray rests on it.
+function updateLightGaze() {
+  const t = state.target;
+  const m = t && state.materials[t.matId];
+  const cell = m && m.action === 'light' ? targetBaseCell(t) : null;
+  const k = cell ? `${cell.x},${cell.y},${cell.z}` : null;
+  if (k === state.lightGaze) return;
+  if (state.lightGaze) {
+    const [x, y, z] = state.lightGaze.split(',').map(Number);
+    sendGameEvent('light', { x, y, z }, 'off');
+  }
+  if (k) {
+    sendGameEvent('light', cell, 'on');
+    showToast('Light sensor lit');
+  }
+  state.lightGaze = k;
+}
+
+// Pressure plate: fires while the player is directly above one.
+function updatePressure() {
+  const fx = Math.floor(state.pos.x), fz = Math.floor(state.pos.z);
+  let found = null;
+  for (let dy = 1; dy <= 3; dy++) {
+    const y = Math.floor(state.pos.y) - dy;
+    const m = state.materials[getVoxel(fx, y, fz)];
+    if (m && m.action === 'pressure') { found = { x: fx, y, z: fz }; break; }
+  }
+  const k = found ? `${found.x},${found.y},${found.z}` : null;
+  if (k === state.pressureCell) return;
+  if (state.pressureCell) {
+    const [x, y, z] = state.pressureCell.split(',').map(Number);
+    sendGameEvent('pressure', { x, y, z }, 'off');
+  }
+  if (k) {
+    sendGameEvent('pressure', found, 'on');
+    showToast('Pressure plate pressed');
+  }
+  state.pressureCell = k;
+}
+
+// ---------------------------------------------------------------------------
+// Lamps: Lamp voxels become real point lights whose colour and strength are
+// governed by the glass around them (stained glass tints, tinted glass dims,
+// clear glass brightens).
+// ---------------------------------------------------------------------------
+const MAX_LAMP_LIGHTS = 8;
+const lampLights = [];
+
+function lampProperties(lamp) {
+  const tints = [];
+  let intensity = 14, distance = 11;
+  for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+                              [0, 0, 1], [0, 0, -1]]) {
+    const m = state.materials[getVoxel(lamp.x + dx, lamp.y + dy, lamp.z + dz)];
+    if (!m) continue;
+    if (m.name.includes('Stained Glass')) tints.push(new THREE.Color(m.color));
+    else if (m.name === 'Tinted Glass') { intensity *= 0.35; distance *= 0.7; }
+    else if (m.name === 'Glass') { intensity *= 1.4; distance *= 1.2; }
+  }
+  let color = new THREE.Color('#fff1cf'); // warm white by default
+  if (tints.length) {
+    color = new THREE.Color(0, 0, 0);
+    for (const tc of tints) color.add(tc);
+    color.multiplyScalar(1 / tints.length);
+  }
+  return { color, intensity, distance };
+}
+
+function updateLampLights() {
+  const lamps = [];
+  for (const chunk of state.chunks.values()) {
+    if (chunk.lamps) lamps.push(...chunk.lamps);
+  }
+  lamps.sort((a, b) =>
+    state.pos.distanceToSquared(new THREE.Vector3(a.x, a.y, a.z)) -
+    state.pos.distanceToSquared(new THREE.Vector3(b.x, b.y, b.z)));
+  const active = lamps.slice(0, MAX_LAMP_LIGHTS);
+  while (lampLights.length < active.length) {
+    const light = new THREE.PointLight(0xffffff, 0, 10, 1.6);
+    scene3.add(light);
+    lampLights.push(light);
+  }
+  for (let i = 0; i < lampLights.length; i++) {
+    const light = lampLights[i];
+    if (i < active.length) {
+      const lamp = active[i];
+      const p = lampProperties(lamp);
+      light.position.set(lamp.x + 0.5, lamp.y + 0.5, lamp.z + 0.5);
+      light.color.copy(p.color);
+      light.intensity = p.intensity;
+      light.distance = p.distance;
+    } else {
+      light.intensity = 0;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live sync: poll the backend for world edits and screen changes it (or
+// other clients) made, and apply them without echoing them back.
+// ---------------------------------------------------------------------------
+function applyRemoteEdit(e) {
+  if (e.op === 'set') {
+    if (getVoxel(e.x, e.y, e.z) !== e.id) {
+      setVoxel(e.x, e.y, e.z, e.id, false);
+    }
+  } else if (e.op === 'sub') {
+    const chunk = chunkAtMm(e.x, e.z);
+    if (!chunk) return;
+    const cur = chunk.sub.get(subKey(e.x, e.y, e.z, e.s));
+    const same = e.id === 0 ? !cur : (cur && cur.mat === e.id);
+    if (!same) setSubVoxel(e.x, e.y, e.z, e.s, e.id, true, false);
+  }
+}
+
+async function pollUpdates() {
+  if (!state.started || !state.scene) return;
+  const sceneName = state.scene.name;
+  try {
+    const res = await fetch(
+      `/api/updates?scene=${sceneName}&since=${state.rev}`);
+    if (!res.ok) return;
+    const p = await res.json();
+    if (!state.scene || state.scene.name !== sceneName) return;
+    state.rev = p.rev;
+    for (const e of p.edits || []) applyRemoteEdit(e);
+    if (screenMgr) screenMgr.applyVersions(p.screens || {});
+  } catch { /* transient network error; next poll retries */ }
+}
+setInterval(pollUpdates, 2000);
+
+// ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
 const el = (id) => document.getElementById(id);
@@ -625,6 +868,15 @@ const targetInfoEl = el('target-info');
 const sizeInfoEl = el('size-info');
 const matModal = el('mat-modal');
 const invModal = el('inv-modal');
+
+let toastTimer = null;
+function showToast(msg) {
+  const t = el('toast');
+  t.textContent = msg;
+  t.classList.add('visible');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('visible'), 2500);
+}
 
 function renderHotbar() {
   hotbarEl.innerHTML = '';
@@ -827,6 +1079,9 @@ invModal.addEventListener('mousedown', (e) => {
 // ---------------------------------------------------------------------------
 const clock = new THREE.Clock();
 let lastChunkUpdate = 0;
+let lastLampUpdate = 0;
+let fluidAcc = 0;
+const FLUID_TICK = 0.1; // seconds; the config's tickMs is advisory
 
 function updateMovement(dt) {
   if (anyModalOpen()) return;
@@ -863,8 +1118,21 @@ function animate() {
       lastChunkUpdate = now;
       updateChunks();
     }
+    if (now - lastLampUpdate > 500) {
+      lastLampUpdate = now;
+      updateLampLights();
+      updatePressure();
+    }
+    if (fluidSim) {
+      fluidAcc += dt;
+      while (fluidAcc >= FLUID_TICK) {
+        fluidAcc -= FLUID_TICK;
+        fluidSim.tick();
+      }
+    }
 
     state.target = raycastVoxel();
+    updateLightGaze();
     if (state.target) {
       const t = state.target;
       highlight.position.set(
@@ -896,11 +1164,23 @@ function clearWorld() {
   state.pending.clear();
 }
 
-function activateScene(meta) {
+async function activateScene(meta) {
   clearWorld();
   state.scene = meta;
   state.pos.set(meta.spawn[0], meta.spawn[1], meta.spawn[2]);
   [state.yaw, state.pitch] = meta.look || [Math.PI * 0.25, -0.25];
+  state.lightGaze = null;
+  state.pressureCell = null;
+  if (fluidSim) fluidSim.clear();
+  if (screenMgr) {
+    screenMgr.clear();
+    screenMgr.load();
+  }
+  // Baseline revision so the updates poll only brings future changes.
+  try {
+    const res = await fetch(`/api/updates?scene=${meta.name}`);
+    state.rev = (await res.json()).rev || 0;
+  } catch { state.rev = 0; }
   renderSceneInfo();
   renderSizeInfo();
   updateChunks();
@@ -937,6 +1217,25 @@ async function boot() {
   state.materials = [];
   for (const m of state.config.materials) state.materials[m.id] = m;
 
+  screenMgr = createScreenManager({
+    THREE, scene3,
+    getSceneName: () => (state.scene ? state.scene.name : ''),
+  });
+  fluidSim = createFluidSim({
+    THREE, scene3,
+    config: state.config.fluids || {},
+    materials: state.materials,
+    toast: showToast,
+    world: {
+      isSolidCell,
+      blockAtCell,
+      subExactAtCell,
+      faucets: loadedFaucets,
+      setBase: (x, y, z, id) => setVoxel(x, y, z, id),
+      setSub: (x, y, z, s, id) => setSubVoxel(x, y, z, s, id),
+    },
+  });
+
   const select = el('scene-select');
   for (const s of state.config.scenes) {
     const opt = document.createElement('option');
@@ -970,5 +1269,7 @@ animate();
 window.__voxel = {
   state, getVoxel, setVoxel, setSubVoxel, destroyBlock, placeBlock,
   pickBlock, raycastVoxel, storedCount, cycleVoxelSize, decompose,
-  toolSizeMm,
+  toolSizeMm, sendGameEvent, isSolidCell, blockAtCell, loadedFaucets,
+  getScreens: () => screenMgr, getFluids: () => fluidSim, pollUpdates,
+  lampLights,
 };
