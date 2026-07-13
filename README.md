@@ -25,8 +25,10 @@ nothing to install and starts instantly.
 
 ## Features
 
-- **WASD** movement, **mouse look** (pointer lock), Space/Shift to fly
-  up/down, hold F to sprint.
+- **WASD** movement, **mouse look** (pointer lock), hold F to sprint.
+  You start in **walk mode**: gravity pulls you down, Space jumps, and
+  WASD still steers mid-air. **Double-tap Space** to toggle **fly mode**
+  (Space/Shift for up/down, no gravity).
 - **Create / Destroy / Store blocks**: left click mines the targeted voxel
   and stores it in your inventory (press **Q** to view), right click places
   a block from the active hotbar slot (stored blocks are consumed first,
