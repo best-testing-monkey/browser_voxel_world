@@ -61,7 +61,10 @@ nothing to install and starts instantly.
   (deliberately a touch slower than the real stuff). Cross effects are
   backend-configured: lava + water freezes to obsidian, wood burns in
   lava, small wooden voxels float up through water, water cools magma to
-  coal — and those effects are persisted world edits.
+  coal — and those effects are persisted world edits. Each fluid type is
+  capped at `maxCellsPerType` cells (default 4000, set in `FLUID_CONFIG`
+  in `server.py`); at the cap, faucets recycle the oldest fluid cell
+  instead of stalling, so streams keep flowing indefinitely.
 - **Day/night cycle**: procedural sky with a visible sun, moon and stars,
   running at 4× realtime by default. The backend owns the clock —
   `POST /api/time {"time": "18:30", "speed": 60}` sets the apparent time

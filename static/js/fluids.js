@@ -76,9 +76,24 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
     return !cells.has(key(x, y, z)) && !world.isSolidCell(x, y, z);
   }
 
+  let spawnSerial = 0;
+
   function spawn(type, x, y, z) {
-    if (counts[type] >= MAX || !isFree(x, y, z)) return;
-    cells.set(key(x, y, z), { x, y, z, type });
+    if (!isFree(x, y, z)) return;
+    if (counts[type] >= MAX) {
+      // At the per-type cap, recycle the oldest cell of this type instead
+      // of stalling the faucet, so sources keep flowing indefinitely.
+      let oldest = null, oldestKey = null;
+      for (const [k, c] of cells) {
+        if (c.type === type && (!oldest || c.born < oldest.born)) {
+          oldest = c;
+          oldestKey = k;
+        }
+      }
+      if (!oldest) return;
+      despawn(oldestKey, oldest);
+    }
+    cells.set(key(x, y, z), { x, y, z, type, born: spawnSerial++ });
     counts[type]++;
   }
 
@@ -188,7 +203,7 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
     if (tickNo % EMIT_EVERY) return;
     for (const f of world.faucets()) {
       const type = FAUCETS.get(f.id);
-      if (!type || counts[type] >= MAX) continue;
+      if (!type) continue; // spawn() recycles the oldest cell when at cap
       const cx = f.x * PER_BLOCK + (PER_BLOCK >> 1) +
         (Math.floor(Math.random() * 3) - 1);
       const cz = f.z * PER_BLOCK + (PER_BLOCK >> 1) +
@@ -218,5 +233,5 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
     render();
   }
 
-  return { tick, clear, cells, counts };
+  return { tick, clear, cells, counts, spawn, maxPerType: MAX };
 }
