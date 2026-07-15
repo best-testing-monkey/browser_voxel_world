@@ -111,6 +111,12 @@ what lava+water freezes into, which "hot" materials water cools, and the
 burn chance for flammables. Fluid *effects* (obsidian, burned wood, cooled
 magma) come back through `POST /api/edits` and persist.
 
+Cells that stop moving for `settleAfterTicks` ticks are promoted to a
+settled tier: excluded from per-tick simulation and from the active cap
+(`maxCellsPerType`), re-rendered only on change, and woken when the world
+changes around them. `maxSettledPerType` (default 20000) bounds the
+settled pool per type.
+
 ## Example: Python client
 
 ```python

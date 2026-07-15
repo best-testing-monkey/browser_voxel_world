@@ -61,10 +61,14 @@ nothing to install and starts instantly.
   (deliberately a touch slower than the real stuff). Cross effects are
   backend-configured: lava + water freezes to obsidian, wood burns in
   lava, small wooden voxels float up through water, water cools magma to
-  coal — and those effects are persisted world edits. Each fluid type is
-  capped at `maxCellsPerType` cells (default 4000, set in `FLUID_CONFIG`
-  in `server.py`); at the cap, faucets recycle the oldest fluid cell
-  instead of stalling, so streams keep flowing indefinitely.
+  coal — and those effects are persisted world edits. Fluid cells that
+  reach equilibrium (no movement for ~1 s) move to a **settled tier**:
+  they cost nothing per tick, don't count against the active cap
+  (`maxCellsPerType`, default 4000), and are only re-rendered when the
+  pool changes. Settled cells wake again when disturbed — a neighbour
+  vacates, a block is placed or mined nearby (mining under a pile causes
+  an avalanche), or a reaction partner arrives. At the active cap,
+  faucets recycle the oldest moving cell instead of stalling.
 - **Day/night cycle**: procedural sky with a visible sun, moon and stars,
   running at 4× realtime by default. The backend owns the clock —
   `POST /api/time {"time": "18:30", "speed": 60}` sets the apparent time

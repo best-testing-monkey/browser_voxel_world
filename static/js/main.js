@@ -221,6 +221,7 @@ function setVoxel(wx, wy, wz, matId, sync = true) {
   if (lz === 0) rebuildChunkAt(cx, cz - 1);
   if (lz === CZ - 1) rebuildChunkAt(cx, cz + 1);
   if (sync) pushEdit({ op: 'set', x: wx, y: wy, z: wz, id: matId });
+  if (fluidSim) fluidSim.disturbBlock(wx, wy, wz);
   return true;
 }
 
@@ -240,6 +241,7 @@ function setSubVoxel(xMm, yMm, zMm, sizeMm, matId, rebuild = true,
   else chunk.sub.set(key, { x: xMm, y: yMm, z: zMm, s: sizeMm, mat: matId });
   if (sync) pushEdit({ op: 'sub', x: xMm, y: yMm, z: zMm, s: sizeMm, id: matId });
   if (rebuild) rebuildChunk(chunk);
+  if (fluidSim) fluidSim.disturbMm(xMm, yMm, zMm, sizeMm);
   return true;
 }
 

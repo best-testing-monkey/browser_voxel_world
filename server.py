@@ -119,7 +119,9 @@ FLUID_CONFIG = {
     },
     "burnChance": 0.15,          # per tick per lava contact with flammables
     "emitEveryTicks": 2,
-    "maxCellsPerType": 4000,
+    "maxCellsPerType": 4000,      # ACTIVE (moving) cells per fluid type
+    "maxSettledPerType": 20000,   # settled (equilibrium) cells per type
+    "settleAfterTicks": 12,       # ticks without movement before settling
     "tickMs": 100,
 }
 
