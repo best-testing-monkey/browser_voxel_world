@@ -3,15 +3,18 @@
 // lava+water makes, what burns, what cools) come from the backend's
 // /api/config "fluids" section — the client just executes them.
 //
-// Fluid cells live in two tiers:
-//   - ACTIVE cells are simulated every tick and count against the per-type
-//     cap (`maxCellsPerType`).
+// Fluid cells live in two tiers and are UNLIMITED in number:
+//   - ACTIVE cells are simulated. `maxCellsPerType` is not a presence cap
+//     but a per-tick movement budget: when more cells are active than the
+//     budget, each tick steps a rotating window of that many cells, so
+//     more moving fluid simply moves slower.
 //   - SETTLED cells reached equilibrium (no movement for `settleAfterTicks`
-//     ticks). They cost nothing per tick: they are not iterated, do not
-//     count against the active cap, and their instanced mesh is only
-//     re-uploaded when the settled pool actually changes. They wake back
-//     into the active tier when disturbed — a neighbouring cell vacates,
-//     a block nearby is placed or removed, or a reaction partner arrives.
+//     ticks). They cost nothing per tick: they are not iterated and their
+//     instanced mesh is only re-uploaded when the settled pool actually
+//     changes. They wake back into the active tier when disturbed — a
+//     neighbouring cell vacates, a block nearby is placed or removed, or
+//     a reaction partner arrives.
+// Instanced meshes grow on demand, so rendering follows the fluid volume.
 //
 // Fluid cells are ephemeral (not persisted); their *effects* are real world
 // edits: obsidian from lava+water, burned wood, cooled magma.
@@ -20,9 +23,8 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
                                  toast }) {
   const CELL = (config.cellMm || 50) / 1000;   // metres
   const PER_BLOCK = Math.round(1 / CELL);      // cells per 1000 mm voxel
-  const MAX = config.maxCellsPerType || 4000;  // active cells per type
-  const SETTLED_MAX = config.maxSettledPerType || 20000;
-  const SETTLE_TICKS = config.settleAfterTicks || 12;
+  const BUDGET = config.maxCellsPerType || 4000; // cells stepped per tick/type
+  const SETTLE_TICKS = config.settleAfterTicks || 8;
   const EMIT_EVERY = config.emitEveryTicks || 2;
   const BURN_CHANCE = config.burnChance || 0.15;
   const OBSIDIAN = config.lavaWaterContact;
@@ -48,21 +50,25 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
 
   // ---- rendering ----
   // One InstancedMesh per type for active cells (updated every tick) and a
-  // second, larger one for settled cells (updated only when they change).
+  // second one for settled cells (updated only when they change). Meshes
+  // grow on demand — fluid presence is unbounded.
   const dummy = new THREE.Object3D();
   const activeMeshes = {};
   const settledMeshes = {};
 
-  function makeMesh(type, color, capacity) {
-    const geo = new THREE.BoxGeometry(CELL * 0.96, CELL * 0.96, CELL * 0.96);
-    const mat = new THREE.MeshLambertMaterial({ color: new THREE.Color(color) });
-    if (type === 'water') {
-      mat.transparent = true;
-      mat.opacity = 0.6;
-    }
-    if (type === 'lava') {
-      mat.emissive = new THREE.Color(color);
-      mat.emissiveIntensity = 0.7;
+  function makeMesh(type, color, capacity, geo = null, mat = null) {
+    geo = geo ||
+      new THREE.BoxGeometry(CELL * 0.96, CELL * 0.96, CELL * 0.96);
+    if (!mat) {
+      mat = new THREE.MeshLambertMaterial({ color: new THREE.Color(color) });
+      if (type === 'water') {
+        mat.transparent = true;
+        mat.opacity = 0.6;
+      }
+      if (type === 'lava') {
+        mat.emissive = new THREE.Color(color);
+        mat.emissiveIntensity = 0.7;
+      }
     }
     const mesh = new THREE.InstancedMesh(geo, mat, capacity);
     mesh.count = 0;
@@ -72,21 +78,36 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
   }
 
   for (const [type, color] of Object.entries(config.colors || {})) {
-    activeMeshes[type] = makeMesh(type, color, MAX);
-    settledMeshes[type] = makeMesh(type, color, SETTLED_MAX);
+    activeMeshes[type] = makeMesh(type, color, BUDGET);
+    settledMeshes[type] = makeMesh(type, color, 8192);
   }
 
-  function writeInstances(meshes, source) {
+  function ensureCapacity(store, type, needed) {
+    const mesh = store[type];
+    if (!mesh || needed <= mesh.instanceMatrix.count) return;
+    const grown = makeMesh(type, null, Math.ceil(needed * 1.5),
+                           mesh.geometry, mesh.material);
+    scene3.remove(mesh);
+    mesh.dispose(); // frees instance buffers; geometry/material are reused
+    store[type] = grown;
+  }
+
+  function writeInstances(store, source) {
+    const needed = { sand: 0, water: 0, lava: 0 };
+    for (const c of source.values()) needed[c.type]++;
+    for (const type of Object.keys(store)) {
+      ensureCapacity(store, type, needed[type]);
+    }
     const idx = { sand: 0, water: 0, lava: 0 };
     for (const c of source.values()) {
-      const mesh = meshes[c.type];
-      if (!mesh || idx[c.type] >= mesh.instanceMatrix.count) continue;
+      const mesh = store[c.type];
+      if (!mesh) continue;
       dummy.position.set(
         c.x * CELL + CELL / 2, c.y * CELL + CELL / 2, c.z * CELL + CELL / 2);
       dummy.updateMatrix();
       mesh.setMatrixAt(idx[c.type]++, dummy.matrix);
     }
-    for (const [type, mesh] of Object.entries(meshes)) {
+    for (const [type, mesh] of Object.entries(store)) {
       mesh.count = idx[type];
       mesh.instanceMatrix.needsUpdate = true;
     }
@@ -139,17 +160,6 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
     settled.set(k, c);
     settledCounts[c.type]++;
     settledDirty = true;
-    if (settledCounts[c.type] > SETTLED_MAX) {
-      // Recycle the oldest settled cell (Maps iterate in insertion order).
-      for (const [ok, oc] of settled) {
-        if (oc.type === c.type) {
-          settled.delete(ok);
-          settledCounts[c.type]--;
-          wakeAround(oc.x, oc.y, oc.z);
-          break;
-        }
-      }
-    }
   }
 
   // Public: the world changed inside this cell-space box (inclusive min,
@@ -185,24 +195,10 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
     return !cells.has(k) && !settled.has(k) && !world.isSolidCell(x, y, z);
   }
 
-  let spawnSerial = 0;
-
   function spawn(type, x, y, z) {
+    // Fluid presence is unbounded — only movement is budgeted per tick.
     if (!isFree(x, y, z)) return;
-    if (counts[type] >= MAX) {
-      // At the active cap, recycle the oldest active cell of this type
-      // instead of stalling the faucet.
-      let oldest = null, oldestKey = null;
-      for (const [k, c] of cells) {
-        if (c.type === type && (!oldest || c.born < oldest.born)) {
-          oldest = c;
-          oldestKey = k;
-        }
-      }
-      if (!oldest) return;
-      despawn(oldestKey, oldest);
-    }
-    cells.set(key(x, y, z), { x, y, z, type, rest: 0, born: spawnSerial++ });
+    cells.set(key(x, y, z), { x, y, z, type, rest: 0 });
     counts[type]++;
   }
 
@@ -332,7 +328,7 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
     if (tickNo % EMIT_EVERY) return;
     for (const f of world.faucets()) {
       const type = FAUCETS.get(f.id);
-      if (!type) continue; // spawn() recycles the oldest cell when at cap
+      if (!type) continue;
       const cx = f.x * PER_BLOCK + (PER_BLOCK >> 1) +
         (Math.floor(Math.random() * 3) - 1);
       const cz = f.z * PER_BLOCK + (PER_BLOCK >> 1) +
@@ -341,11 +337,33 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
     }
   }
 
+  const cursor = { sand: 0, water: 0, lava: 0 };
+
   function tick() {
     tickNo++;
     emit();
-    const list = [...cells.values()].sort((a, b) => a.y - b.y);
-    for (const c of list) {
+    // Movement budget: when more cells of a type are active than BUDGET,
+    // step a rotating window of BUDGET cells so every cell still gets its
+    // turn — more moving fluid just moves proportionally slower.
+    const byType = { sand: [], water: [], lava: [] };
+    for (const c of cells.values()) {
+      if (byType[c.type]) byType[c.type].push(c);
+    }
+    const toStep = [];
+    for (const [type, list] of Object.entries(byType)) {
+      if (list.length <= BUDGET) {
+        cursor[type] = 0;
+        toStep.push(...list);
+      } else {
+        const start = cursor[type] % list.length;
+        for (let i = 0; i < BUDGET; i++) {
+          toStep.push(list[(start + i) % list.length]);
+        }
+        cursor[type] = (start + BUDGET) % list.length;
+      }
+    }
+    toStep.sort((a, b) => a.y - b.y);
+    for (const c of toStep) {
       if (c.type === 'lava' && tickNo % 2) continue; // lava is slower
       if (c.type === 'sand' && tickNo % 2 === 0 && Math.random() < 0.3) {
         continue; // sand a touch slower than water
@@ -372,6 +390,5 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
   }
 
   return { tick, clear, cells, settled, counts, settledCounts, spawn,
-           disturbBlock, disturbMm, maxPerType: MAX,
-           maxSettledPerType: SETTLED_MAX };
+           disturbBlock, disturbMm, budgetPerType: BUDGET };
 }
