@@ -111,6 +111,14 @@ what lava+water freezes into, which "hot" materials water cools, and the
 burn chance for flammables. Fluid *effects* (obsidian, burned wood, cooled
 magma) come back through `POST /api/edits` and persist.
 
+Fluid presence is unbounded — cells are never despawned to make room.
+`maxCellsPerType` is a per-tick movement budget: when more cells are in
+motion than the budget, a rotating window of that many cells is stepped
+each tick, so heavy flows slow down instead of losing volume. Cells that
+stop moving for `settleAfterTicks` ticks are promoted to a settled tier:
+excluded from simulation and from the movement budget, re-rendered only
+on change, and woken when the world changes around them.
+
 ## Example: Python client
 
 ```python

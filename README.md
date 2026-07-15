@@ -25,8 +25,10 @@ nothing to install and starts instantly.
 
 ## Features
 
-- **WASD** movement, **mouse look** (pointer lock), Space/Shift to fly
-  up/down, hold F to sprint.
+- **WASD** movement, **mouse look** (pointer lock), hold F to sprint.
+  You start in **walk mode**: gravity pulls you down, Space jumps, and
+  WASD still steers mid-air. **Double-tap Space** to toggle **fly mode**
+  (Space/Shift for up/down, no gravity).
 - **Create / Destroy / Store blocks**: left click mines the targeted voxel
   and stores it in your inventory (press **Q** to view), right click places
   a block from the active hotbar slot (stored blocks are consumed first,
@@ -59,7 +61,17 @@ nothing to install and starts instantly.
   (deliberately a touch slower than the real stuff). Cross effects are
   backend-configured: lava + water freezes to obsidian, wood burns in
   lava, small wooden voxels float up through water, water cools magma to
-  coal — and those effects are persisted world edits.
+  coal — and those effects are persisted world edits. Fluid is
+  **unlimited in presence**: nothing is ever despawned to make room.
+  `maxCellsPerType` (default 4000) is a per-tick *movement budget* — when
+  more cells are in motion than the budget, each tick steps a rotating
+  window of that many cells, so more moving fluid simply moves slower.
+  Cells that reach equilibrium (no movement for `settleAfterTicks`) move
+  to a **settled tier**: they cost nothing per tick, don't consume the
+  movement budget, and re-render only when the pool changes. Settled
+  cells wake when disturbed — a neighbour vacates, a block is placed or
+  mined nearby (mining under a pile causes an avalanche), or a reaction
+  partner arrives.
 - **Day/night cycle**: procedural sky with a visible sun, moon and stars,
   running at 4× realtime by default. The backend owns the clock —
   `POST /api/time {"time": "18:30", "speed": 60}` sets the apparent time

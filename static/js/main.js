@@ -17,6 +17,11 @@ const UNLOAD_RADIUS = LOAD_RADIUS + 2;
 const REACH = 8;                // block interaction distance (metres)
 const FLY_SPEED = 12;
 const SPRINT_MULT = 2.6;
+const WALK_SPEED = 5.2;
+const WALK_SPRINT_MULT = 1.8;
+const GRAVITY = 24;             // m/s^2
+const JUMP_VELOCITY = 8;        // ~1.3 m jump height
+const TERMINAL_VELOCITY = 50;
 const MM = 1000;                // mm per metre / per base grid cell
 
 let CX = 16, CY = 64, CZ = 16;  // chunk dimensions (from backend config)
@@ -42,6 +47,9 @@ const state = {
   lightGaze: null,              // cell key currently firing the light sensor
   pressureCell: null,           // cell key currently holding a pressure plate
   noclip: false,                // N toggles collision off for free flight
+  mode: 'walk',                 // 'walk' (gravity) | 'fly'; double-tap Space
+  vy: 0,                        // vertical velocity in walk mode (m/s)
+  grounded: false,
 };
 
 let screenMgr = null;           // created once config is loaded
@@ -154,7 +162,9 @@ function updateSky() {
   if (clockEl) {
     const hh = String(Math.floor(h)).padStart(2, '0');
     const mm = String(Math.floor((h % 1) * 60)).padStart(2, '0');
-    const text = `☀ ${hh}:${mm} · ${timeState.speed}× realtime`;
+    const mode = state.noclip ? 'no-clip'
+      : (state.mode === 'fly' ? 'fly' : 'walk');
+    const text = `☀ ${hh}:${mm} · ${timeState.speed}× realtime · ${mode}`;
     if (text !== lastClockText) {
       lastClockText = text;
       clockEl.textContent = text;
@@ -211,6 +221,7 @@ function setVoxel(wx, wy, wz, matId, sync = true) {
   if (lz === 0) rebuildChunkAt(cx, cz - 1);
   if (lz === CZ - 1) rebuildChunkAt(cx, cz + 1);
   if (sync) pushEdit({ op: 'set', x: wx, y: wy, z: wz, id: matId });
+  if (fluidSim) fluidSim.disturbBlock(wx, wy, wz);
   return true;
 }
 
@@ -230,6 +241,7 @@ function setSubVoxel(xMm, yMm, zMm, sizeMm, matId, rebuild = true,
   else chunk.sub.set(key, { x: xMm, y: yMm, z: zMm, s: sizeMm, mat: matId });
   if (sync) pushEdit({ op: 'sub', x: xMm, y: yMm, z: zMm, s: sizeMm, id: matId });
   if (rebuild) rebuildChunk(chunk);
+  if (fluidSim) fluidSim.disturbMm(xMm, yMm, zMm, sizeMm);
   return true;
 }
 
@@ -1123,6 +1135,19 @@ document.addEventListener('keydown', (e) => {
     state.noclip = !state.noclip;
     showToast(`No-clip ${state.noclip ? 'on — collision off' : 'off — collision on'}`);
   }
+  if (e.code === 'Space' && !e.repeat) {
+    const now = performance.now();
+    if (now - (state.lastSpaceTap || 0) < 400) {
+      state.mode = state.mode === 'fly' ? 'walk' : 'fly';
+      state.vy = 0;
+      showToast(state.mode === 'fly'
+        ? 'Fly mode — Space/Shift for up/down'
+        : 'Walk mode — gravity on, Space to jump');
+      state.lastSpaceTap = 0;
+    } else {
+      state.lastSpaceTap = now;
+    }
+  }
 
   if (e.code.startsWith('Digit')) {
     const n = parseInt(e.code.slice(5), 10);
@@ -1216,30 +1241,61 @@ function boxCollides(px, py, pz) {
 
 function updateMovement(dt) {
   if (anyModalOpen()) return;
-  const speed = FLY_SPEED * (state.keys.has('KeyF') ? SPRINT_MULT : 1);
+  const flying = state.mode === 'fly' || state.noclip;
   const forward = new THREE.Vector3(
     -Math.sin(state.yaw), 0, -Math.cos(state.yaw));
   const right = new THREE.Vector3(-forward.z, 0, forward.x);
+
+  // Horizontal input works in every mode — including mid-fall.
   const move = new THREE.Vector3();
   if (state.keys.has('KeyW')) move.add(forward);
   if (state.keys.has('KeyS')) move.sub(forward);
   if (state.keys.has('KeyD')) move.add(right);
   if (state.keys.has('KeyA')) move.sub(right);
-  if (state.keys.has('Space')) move.y += 1;
-  if (state.keys.has('ShiftLeft') || state.keys.has('ShiftRight')) move.y -= 1;
-  if (move.lengthSq() > 0) {
-    move.normalize().multiplyScalar(speed * dt);
-    if (state.noclip) {
-      state.pos.add(move);
-    } else {
-      // Resolve each axis separately so we slide along walls. If we are
-      // already stuck inside something (e.g. a block placed on us), allow
-      // movement so the player can escape.
-      const stuck = boxCollides(state.pos.x, state.pos.y, state.pos.z);
-      const p = state.pos;
-      if (stuck || !boxCollides(p.x + move.x, p.y, p.z)) p.x += move.x;
-      if (stuck || !boxCollides(p.x, p.y + move.y, p.z)) p.y += move.y;
-      if (stuck || !boxCollides(p.x, p.y, p.z + move.z)) p.z += move.z;
+  const sprint = state.keys.has('KeyF');
+
+  if (flying) {
+    if (state.keys.has('Space')) move.y += 1;
+    if (state.keys.has('ShiftLeft') || state.keys.has('ShiftRight')) {
+      move.y -= 1;
+    }
+    if (move.lengthSq() > 0) {
+      move.normalize().multiplyScalar(
+        FLY_SPEED * (sprint ? SPRINT_MULT : 1) * dt);
+    }
+    state.vy = 0;
+    state.grounded = false;
+  } else {
+    // Walk mode: gravity pulls, Space jumps from the ground.
+    if (move.lengthSq() > 0) {
+      move.normalize().multiplyScalar(
+        WALK_SPEED * (sprint ? WALK_SPRINT_MULT : 1) * dt);
+    }
+    state.vy = Math.max(state.vy - GRAVITY * dt, -TERMINAL_VELOCITY);
+    if (state.keys.has('Space') && state.grounded) {
+      state.vy = JUMP_VELOCITY;
+      state.grounded = false;
+    }
+    move.y = state.vy * dt;
+  }
+
+  if (state.noclip) {
+    state.pos.add(move);
+  } else {
+    // Resolve each axis separately so we slide along walls. If we are
+    // already stuck inside something (e.g. a block placed on us), allow
+    // movement so the player can escape.
+    const stuck = boxCollides(state.pos.x, state.pos.y, state.pos.z);
+    const p = state.pos;
+    if (stuck || !boxCollides(p.x + move.x, p.y, p.z)) p.x += move.x;
+    if (stuck || !boxCollides(p.x, p.y, p.z + move.z)) p.z += move.z;
+    if (stuck || !boxCollides(p.x, p.y + move.y, p.z)) {
+      p.y += move.y;
+      if (!flying) state.grounded = false;
+    } else if (!flying) {
+      // Vertical motion blocked: landed (falling) or bonked (jumping).
+      if (state.vy < 0) state.grounded = true;
+      state.vy = 0;
     }
   }
   state.pos.y = Math.max(1, Math.min(CY + 40, state.pos.y));

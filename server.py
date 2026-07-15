@@ -119,7 +119,11 @@ FLUID_CONFIG = {
     },
     "burnChance": 0.15,          # per tick per lava contact with flammables
     "emitEveryTicks": 2,
-    "maxCellsPerType": 1200,
+    # Movement budget, NOT a presence cap: fluid cells are unlimited in
+    # number; at most this many active cells per type are stepped each
+    # tick (a rotating window), so more moving fluid just moves slower.
+    "maxCellsPerType": 4000,
+    "settleAfterTicks": 8,        # ticks without movement before settling
     "tickMs": 100,
 }
 
