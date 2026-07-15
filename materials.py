@@ -414,6 +414,29 @@ INTERACTIVE_MATERIALS = [
 _FLAMMABLE_HINTS = ("Planks", "Log", " Wood", "Bookshelf", "Hay Bale",
                     "Timber", "Plywood", "Lumber")
 
+# Light-emitting materials: {name: light level 1..15}. The client's voxel
+# lighting engine floods block-light from these.
+EMISSIVE_LEVELS = {
+    "Lamp": 15,
+    "Glowstone": 15,
+    "Sea Lantern": 15,
+    "Lava": 15,
+    "Ochre Froglight": 15,
+    "Verdant Froglight": 15,
+    "Pearlescent Froglight": 15,
+    "Shroomlight": 12,
+    "Jack o'Lantern": 12,
+    "Redstone Lamp": 12,
+    "Lava Faucet": 10,
+    "Magma Block": 8,
+    "Crying Obsidian": 7,
+    "Amethyst Cluster": 5,
+}
+
+# Materials light passes through (they don't block sky- or block-light).
+_TRANSLUCENT_HINTS = ("Glass",)
+_TRANSLUCENT_EXACT = {"Water", "Ice", "Packed Ice", "Blue Ice"}
+
 
 def build_materials():
     materials = []
@@ -484,6 +507,12 @@ def build_materials():
         if m["category"] == "Wood" or \
                 any(h in m["name"] for h in _FLAMMABLE_HINTS):
             m["flammable"] = True
+        level = EMISSIVE_LEVELS.get(m["name"])
+        if level:
+            m["emissive"] = level
+        if m["name"] in _TRANSLUCENT_EXACT or \
+                any(h in m["name"] for h in _TRANSLUCENT_HINTS):
+            m["translucent"] = True
 
     assert len(materials) >= MINIMUM_MATERIALS, len(materials)
     return materials

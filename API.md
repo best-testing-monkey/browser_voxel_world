@@ -10,8 +10,10 @@ Base URL: `http://127.0.0.1:8000` (or wherever `server.py` runs).
 
 ### `GET /api/config`
 Materials catalog (1032 entries: id, name, category, color, plus optional
-`action` / `flammable` flags), scenes with spawn points and POIs, voxel size
-chain (`[1000, 500, 100, 50, 10]` mm), and the fluid rule table.
+`action` / `flammable` / `emissive` (light level 1–15, colour taken from
+the material colour) / `translucent` (passes and tints light) flags),
+scenes with spawn points and POIs, voxel size chain
+(`[1000, 500, 100, 50, 10]` mm), and the fluid rule table.
 
 ### `GET /api/chunk?scene=S&cx=N&cz=N`
 One 16×64×16 chunk: `voxels` is a base64 little-endian uint16 array of

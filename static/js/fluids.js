@@ -73,6 +73,7 @@ export function createFluidSim({ THREE, scene3, config, materials, world,
     const mesh = new THREE.InstancedMesh(geo, mat, capacity);
     mesh.count = 0;
     mesh.frustumCulled = false;
+    mesh.layers.enable(1); // the directional sun lives on layer 1
     scene3.add(mesh);
     return mesh;
   }

@@ -1,6 +1,7 @@
 import * as THREE from '/vendor/three.module.js';
 import { createScreenManager } from '/js/screens.js';
 import { createFluidSim } from '/js/fluids.js';
+import { createLightEngine } from '/js/lighting.js';
 
 // ---------------------------------------------------------------------------
 // Config & state
@@ -54,6 +55,7 @@ const state = {
 
 let screenMgr = null;           // created once config is loaded
 let fluidSim = null;
+let lightEngine = null;         // voxel flood-fill lighting
 
 const toolSizeMm = () => state.sizesMm[state.sizeIdx];
 
@@ -72,12 +74,16 @@ scene3.fog = new THREE.Fog(0x87b5e0, 40, 120);
 const camera = new THREE.PerspectiveCamera(
   75, window.innerWidth / window.innerHeight, 0.05, 600);
 
+// The directional sun lives on layer 1 so it does NOT direct-light chunk
+// meshes (their sun exposure comes from the baked skylight, which terrain
+// occludes — that's what makes caves dark). Fluids opt into layer 1.
 const sun = new THREE.DirectionalLight(0xffffff, 2.2);
 sun.position.set(0.45, 1, 0.3);
+sun.layers.set(1);
 scene3.add(sun);
-const ambientLight = new THREE.AmbientLight(0xbfd4ea, 0.9);
+const ambientLight = new THREE.AmbientLight(0xbfd4ea, 0.35);
 scene3.add(ambientLight);
-const hemiLight = new THREE.HemisphereLight(0xcfe5ff, 0x6b6252, 0.5);
+const hemiLight = new THREE.HemisphereLight(0xcfe5ff, 0x6b6252, 0.25);
 scene3.add(hemiLight);
 
 // ---------------------------------------------------------------------------
@@ -149,8 +155,9 @@ function updateSky() {
   sun.position.copy(_sunDir);
   sun.intensity = 0.1 + 2.3 * day;
   sun.color.copy(SUN_DAY).lerp(SUN_LOW, dusk);
-  ambientLight.intensity = 0.22 + 0.68 * day;
-  hemiLight.intensity = 0.12 + 0.42 * day;
+  ambientLight.intensity = 0.08 + 0.3 * day;
+  hemiLight.intensity = 0.05 + 0.2 * day;
+  dayUniform.value = day; // scales baked skylight in the chunk shader
 
   sunMesh.position.copy(camera.position).addScaledVector(_sunDir, 380);
   moonMesh.position.copy(camera.position).addScaledVector(_sunDir, -380);
@@ -172,7 +179,34 @@ function updateSky() {
   }
 }
 
+// Chunk material: Lambert (so lamp PointLights still work) patched with two
+// extra vertex attributes carrying the baked voxel light — skylight (scaled
+// by the day/night uniform) and blocklight (time-independent, lights caves).
+// The ambient/indirect term is replaced entirely by that baked light, so
+// terrain occlusion actually darkens holes and caves.
+const MIN_LIGHT = 0.04;
+const dayUniform = { value: 1.0 };
 const chunkMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
+chunkMaterial.onBeforeCompile = (shader) => {
+  shader.uniforms.uDay = dayUniform;
+  shader.vertexShader =
+    'attribute vec3 aSky;\nattribute vec3 aBlock;\n' +
+    'varying vec3 vSky;\nvarying vec3 vBlock;\n' +
+    shader.vertexShader.replace(
+      '#include <color_vertex>',
+      '#include <color_vertex>\n  vSky = aSky;\n  vBlock = aBlock;');
+  shader.fragmentShader =
+    'uniform float uDay;\nvarying vec3 vSky;\nvarying vec3 vBlock;\n' +
+    shader.fragmentShader.replace(
+      '#include <lights_fragment_begin>',
+      '#include <lights_fragment_begin>\n' +
+      '  reflectedLight.indirectDiffuse = diffuseColor.rgb * ' +
+      `min(vec3(1.2), vec3(${MIN_LIGHT}) + vBlock + vSky * uDay);`);
+};
+
+// Light-level (0..15) to brightness, Minecraft-ish response curve.
+const LIGHT_CURVE = Array.from({ length: 16 },
+  (_, i) => Math.pow(i / 15, 1.6));
 
 // Highlight wireframe for the targeted voxel (unit cube, scaled per target)
 const highlight = new THREE.LineSegments(
@@ -222,6 +256,7 @@ function setVoxel(wx, wy, wz, matId, sync = true) {
   if (lz === CZ - 1) rebuildChunkAt(cx, cz + 1);
   if (sync) pushEdit({ op: 'set', x: wx, y: wy, z: wz, id: matId });
   if (fluidSim) fluidSim.disturbBlock(wx, wy, wz);
+  if (lightEngine) lightEngine.markDirty(cx, cz, remeshRelit);
   return true;
 }
 
@@ -242,6 +277,9 @@ function setSubVoxel(xMm, yMm, zMm, sizeMm, matId, rebuild = true,
   if (sync) pushEdit({ op: 'sub', x: xMm, y: yMm, z: zMm, s: sizeMm, id: matId });
   if (rebuild) rebuildChunk(chunk);
   if (fluidSim) fluidSim.disturbMm(xMm, yMm, zMm, sizeMm);
+  if (lightEngine && rebuild) {
+    lightEngine.markDirty(chunk.cx, chunk.cz, remeshRelit);
+  }
   return true;
 }
 
@@ -302,6 +340,11 @@ function loadedFaucets() {
 function rebuildChunkAt(cx, cz) {
   const chunk = state.chunks.get(chunkKey(cx, cz));
   if (chunk && chunk.data) rebuildChunk(chunk);
+}
+
+// After a relight pass, re-mesh every chunk whose light field changed.
+function remeshRelit(chunks) {
+  for (const chunk of chunks) rebuildChunk(chunk);
 }
 
 // ---------------------------------------------------------------------------
@@ -367,13 +410,27 @@ function voxelJitter(x, y, z) {
 
 function rebuildChunk(chunk) {
   const positions = [], normals = [], colors = [], indices = [];
+  const skys = [], blocks = [];
   const ox = chunk.cx * CX, oz = chunk.cz * CZ;
   const layer = CX * CZ;
 
-  const emitBox = (bx, by, bz, size, matId, jitter, cullFn) => {
+  // Baked voxel light for a face: sample the air cell the face looks into.
+  // Returns curved RGB for both channels.
+  const faceLight = (x, y, z) => {
+    if (!lightEngine) return [[1, 1, 1], [0, 0, 0]];
+    const l = lightEngine.lightAt(x, y, z);
+    return [
+      [LIGHT_CURVE[l.sky[0]], LIGHT_CURVE[l.sky[1]], LIGHT_CURVE[l.sky[2]]],
+      [LIGHT_CURVE[l.block[0]], LIGHT_CURVE[l.block[1]],
+       LIGHT_CURVE[l.block[2]]],
+    ];
+  };
+
+  const emitBox = (bx, by, bz, size, matId, jitter, cullFn, lightFn) => {
     const rgb = materialRGB(matId);
     for (const face of FACES) {
       if (cullFn && cullFn(face)) continue;
+      const [skyC, blockC] = lightFn(face);
       const base = positions.length / 3;
       for (const c of face.corners) {
         positions.push(bx + c[0] * size, by + c[1] * size, bz + c[2] * size);
@@ -383,6 +440,8 @@ function rebuildChunk(chunk) {
           Math.min(1, rgb[0] * s),
           Math.min(1, rgb[1] * s),
           Math.min(1, rgb[2] * s));
+        skys.push(skyC[0], skyC[1], skyC[2]);
+        blocks.push(blockC[0], blockC[1], blockC[2]);
       }
       indices.push(base, base + 1, base + 2, base + 2, base + 1, base + 3);
     }
@@ -405,7 +464,9 @@ function rebuildChunk(chunk) {
         }
         emitBox(wx, y, wz, 1, matId, voxelJitter(wx, y, wz),
           (face) => getVoxel(wx + face.dir[0], y + face.dir[1],
-                             wz + face.dir[2]) !== 0);
+                             wz + face.dir[2]) !== 0,
+          (face) => faceLight(wx + face.dir[0], y + face.dir[1],
+                              wz + face.dir[2]));
       }
     }
   }
@@ -414,8 +475,12 @@ function rebuildChunk(chunk) {
   // Also refresh the 50 mm occupancy set used by the fluid simulation.
   chunk.subCells = new Set();
   for (const sv of chunk.sub.values()) {
+    // Sub-voxels sample the light of their containing 1 m cell.
+    const cellLight = faceLight(
+      Math.floor(sv.x / MM), Math.floor(sv.y / MM), Math.floor(sv.z / MM));
     emitBox(sv.x / MM, sv.y / MM, sv.z / MM, sv.s / MM, sv.mat,
-      voxelJitter(sv.x / 10 | 0, sv.y / 10 | 0, sv.z / 10 | 0), null);
+      voxelJitter(sv.x / 10 | 0, sv.y / 10 | 0, sv.z / 10 | 0), null,
+      () => cellLight);
     const n = sv.s / 50;
     const cx0 = sv.x / 50, cy0 = sv.y / 50, cz0 = sv.z / 50;
     for (let i = 0; i < n; i++) {
@@ -438,6 +503,8 @@ function rebuildChunk(chunk) {
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.setAttribute('aSky', new THREE.Float32BufferAttribute(skys, 3));
+  geo.setAttribute('aBlock', new THREE.Float32BufferAttribute(blocks, 3));
   geo.setIndex(indices);
   chunk.mesh = new THREE.Mesh(geo, chunkMaterial);
   chunk.mesh.frustumCulled = true;
@@ -478,6 +545,7 @@ async function fetchChunk(cx, cz) {
     rebuildChunkAt(cx + 1, cz);
     rebuildChunkAt(cx, cz - 1);
     rebuildChunkAt(cx, cz + 1);
+    if (lightEngine) lightEngine.markDirty(cx, cz, remeshRelit);
   } catch (err) {
     console.error(err);
   } finally {
@@ -1407,6 +1475,7 @@ function clearWorld() {
   }
   state.chunks.clear();
   state.pending.clear();
+  if (lightEngine) lightEngine.reset();
 }
 
 async function activateScene(meta) {
@@ -1454,6 +1523,9 @@ async function boot() {
   }
 
   [CX, CY, CZ] = state.config.chunkSize;
+  lightEngine = createLightEngine({
+    state, dims: { CX, CY, CZ }, getVoxel,
+  });
   if (state.config.voxelSizesMm) {
     state.sizesMm = state.config.voxelSizesMm.map((s) => s | 0);
     state.sizeIdx = Math.max(
@@ -1520,4 +1592,5 @@ window.__voxel = {
   toolSizeMm, sendGameEvent, isSolidCell, blockAtCell, loadedFaucets,
   getScreens: () => screenMgr, getFluids: () => fluidSim, pollUpdates,
   lampLights, boxCollides, apparentHours, syncTime, timeState,
+  lightAt: (x, y, z) => (lightEngine ? lightEngine.lightAt(x, y, z) : null),
 };
