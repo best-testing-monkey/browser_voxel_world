@@ -700,43 +700,89 @@ function destroyBlock() {
   if (!t) return;
   const tool = toolSizeMm();
 
-  if (t.kind === 'base' && tool === MM) {
-    // Remove a whole default-size voxel.
+  if (tool < t.sizeMm) {
+    // Carve: remove a tool-sized piece out of a bigger voxel and decompose
+    // the remainder into smaller voxels of the same material.
+    const cell = innerCell(t, tool);
+    const remainder = [];
+    if (t.kind === 'base') {
+      const ox = t.base.x * MM, oy = t.base.y * MM, oz = t.base.z * MM;
+      decompose(ox, oy, oz, MM, cell.x, cell.y, cell.z, tool, remainder);
+    } else {
+      decompose(t.sub.x, t.sub.y, t.sub.z, t.sub.s,
+                cell.x, cell.y, cell.z, tool, remainder);
+      setSubVoxel(t.sub.x, t.sub.y, t.sub.z, t.sub.s, 0, false);
+    }
+    for (const [x, y, z, s] of remainder) {
+      setSubVoxel(x, y, z, s, t.matId, false);
+    }
+    if (t.kind === 'base') {
+      // setVoxel rebuilds the chunk, which also picks up the new sub-voxels.
+      setVoxel(t.base.x, t.base.y, t.base.z, 0);
+    } else {
+      const chunk = chunkAtMm(t.sub.x, t.sub.z);
+      if (chunk) rebuildChunk(chunk);
+    }
     storeBlock(t.matId);
-    setVoxel(t.base.x, t.base.y, t.base.z, 0);
     return;
   }
 
-  if (t.kind === 'sub' && tool >= t.sub.s) {
-    // Tool is at least as big as the voxel: remove it whole.
-    storeBlock(t.matId);
-    setSubVoxel(t.sub.x, t.sub.y, t.sub.z, t.sub.s, 0);
-    return;
-  }
+  // Tool is at least as big as the hit voxel: hollow out the whole
+  // tool-aligned cell around the hit point. That may remove several
+  // smaller voxels in one strike.
+  const eps = 0.5;
+  const px = t.point.x * MM - t.normal.x * eps;
+  const py = t.point.y * MM - t.normal.y * eps;
+  const pz = t.point.z * MM - t.normal.z * eps;
+  const rx = floorTo(px, tool), ry = floorTo(py, tool),
+        rz = floorTo(pz, tool);
 
-  // Carve: remove a tool-sized piece out of a bigger voxel and decompose
-  // the remainder into smaller voxels of the same material.
-  const cell = innerCell(t, tool);
-  const remainder = [];
-  if (t.kind === 'base') {
-    const ox = t.base.x * MM, oy = t.base.y * MM, oz = t.base.z * MM;
-    decompose(ox, oy, oz, MM, cell.x, cell.y, cell.z, tool, remainder);
-  } else {
-    decompose(t.sub.x, t.sub.y, t.sub.z, t.sub.s,
-              cell.x, cell.y, cell.z, tool, remainder);
-    setSubVoxel(t.sub.x, t.sub.y, t.sub.z, t.sub.s, 0, false);
+  if (tool === MM) {
+    const bx = rx / MM, by = ry / MM, bz = rz / MM;
+    if (getVoxel(bx, by, bz)) {
+      storeBlock(t.matId);
+      setVoxel(bx, by, bz, 0);
+    }
   }
-  for (const [x, y, z, s] of remainder) {
-    setSubVoxel(x, y, z, s, t.matId, false);
+  clearSubsInBox(rx, ry, rz, tool);
+}
+
+// Remove every sub-voxel fully inside the tool-aligned box; if a *bigger*
+// sub-voxel fully contains the box, carve the box out of it instead.
+function clearSubsInBox(x, y, z, size) {
+  const chunk = chunkAtMm(x, z);
+  if (!chunk) return;
+  let removed = 0;
+  let container = null;
+  for (const sv of [...chunk.sub.values()]) {
+    if (sv.x >= x && sv.x + sv.s <= x + size &&
+        sv.y >= y && sv.y + sv.s <= y + size &&
+        sv.z >= z && sv.z + sv.s <= z + size) {
+      setSubVoxel(sv.x, sv.y, sv.z, sv.s, 0, false);
+      state.inventory.set(sv.mat, storedCount(sv.mat) + 1);
+      removed++;
+    } else if (sv.s > size &&
+               x >= sv.x && x + size <= sv.x + sv.s &&
+               y >= sv.y && y + size <= sv.y + sv.s &&
+               z >= sv.z && z + size <= sv.z + sv.s) {
+      container = sv;
+    }
   }
-  if (t.kind === 'base') {
-    // setVoxel rebuilds the chunk, which also picks up the new sub-voxels.
-    setVoxel(t.base.x, t.base.y, t.base.z, 0);
-  } else {
-    const chunk = chunkAtMm(t.sub.x, t.sub.z);
-    if (chunk) rebuildChunk(chunk);
+  if (container) {
+    const remainder = [];
+    decompose(container.x, container.y, container.z, container.s,
+              x, y, z, size, remainder);
+    setSubVoxel(container.x, container.y, container.z, container.s, 0, false);
+    for (const [nx, ny, nz, ns] of remainder) {
+      setSubVoxel(nx, ny, nz, ns, container.mat, false);
+    }
+    state.inventory.set(container.mat, storedCount(container.mat) + 1);
+    removed++;
   }
-  storeBlock(t.matId);
+  if (removed) {
+    renderHotbar();
+    rebuildChunk(chunk);
+  }
 }
 
 function subOverlaps(xMm, yMm, zMm, sMm) {
