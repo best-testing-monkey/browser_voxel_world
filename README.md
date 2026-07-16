@@ -54,9 +54,17 @@ nothing to install and starts instantly.
   it) POST events to the backend (`/api/events`). Poll them, receive them
   by webhook (`/api/subscribe`), or handle them in-process — the demo
   handler rewrites the Sensor Board and toggles indicator blocks.
-- **Lamps**: the Lamp material is a real point light; its colour and
-  strength are governed by the glass around it (stained glass tints,
-  clear glass brightens, tinted glass dims).
+- **Voxel lighting**: Minecraft-style flood-fill light with *coloured*
+  RGB channels. Skylight is occluded by terrain — dug holes and caves are
+  dark — and scales with the day/night cycle. Light-emitting materials
+  (Lamp, Glowstone, Sea Lantern, lava, froglights…, levels defined in the
+  backend material catalog via the `emissive` field) flood block-light in
+  their own colour, so caves are lit by light materials. Light passing
+  through stained glass is filtered per colour channel: sunlight through
+  a blue pane is blue, and a lamp behind orange glass casts orange light.
+- **Lamps**: the Lamp material additionally drives a real point light;
+  its colour and strength are governed by the glass around it (stained
+  glass tints, clear glass brightens, tinted glass dims).
 - **Fluids**: Sand/Water/Lava Faucet blocks pour 5 cm fluid voxels
   (deliberately a touch slower than the real stuff). Cross effects are
   backend-configured: lava + water freezes to obsidian, wood burns in
