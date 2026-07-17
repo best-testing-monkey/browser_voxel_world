@@ -234,17 +234,6 @@ MINECRAFT_BASE = [
     "Suspicious Gravel", "Decorated Pot", "Piston", "Sticky Piston",
     "Observer", "Dispenser", "Dropper", "Hopper", "Redstone Lamp",
     "Note Block", "Jukebox", "Monster Spawner", "Amethyst Cluster",
-]
-
-MINECRAFT_DYED_FAMILIES = [
-    "Wool", "Concrete", "Concrete Powder", "Terracotta", "Glazed Terracotta",
-    "Stained Glass", "Shulker Box", "Candle Block",
-]
-
-# Additional solid (full-cube) Minecraft blocks not already covered above:
-# deepslate ore variants, deepslate/tuff decorative finishes, copper
-# oxidation-stage variants, and mangrove roots.
-MISSING_SOLIDS = [
     "Deepslate Coal Ore", "Deepslate Iron Ore", "Deepslate Copper Ore",
     "Deepslate Gold Ore", "Deepslate Redstone Ore", "Deepslate Emerald Ore",
     "Deepslate Lapis Lazuli Ore", "Deepslate Diamond Ore",
@@ -257,6 +246,11 @@ MISSING_SOLIDS = [
     "Exposed Copper Bulb", "Weathered Copper Bulb", "Oxidized Copper Bulb",
     "Copper Grate", "Exposed Copper Grate", "Mangrove Roots",
     "Muddy Mangrove Roots",
+]
+
+MINECRAFT_DYED_FAMILIES = [
+    "Wool", "Concrete", "Concrete Powder", "Terracotta", "Glazed Terracotta",
+    "Stained Glass", "Shulker Box", "Candle Block",
 ]
 
 BUILDING_MATERIALS = [
@@ -595,8 +589,6 @@ def build_materials():
     for family in MINECRAFT_DYED_FAMILIES:
         for dye, color in DYE_COLORS.items():
             add(f"{dye} {family}", "Minecraft", color)
-    for name in MISSING_SOLIDS:
-        add(name, "Minecraft")
     for name in BUILDING_MATERIALS:
         add(name, "Building")
     for name in CRAFTING_MATERIALS:
