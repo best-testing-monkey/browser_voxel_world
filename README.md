@@ -32,7 +32,7 @@ nothing to install and starts instantly.
 - **WASD** movement, **mouse look** (pointer lock), hold F to sprint.
   You start in **walk mode**: gravity pulls you down, Space jumps, and
   WASD still steers mid-air. **Double-tap Space** to toggle **fly mode**
-  (Space/Shift for up/down, no gravity).
+  (Space/Left Shift for up/down, no gravity).
 - **Create / Destroy / Store blocks**: left click mines the targeted voxel
   and stores it in your inventory (press **Q** to view), right click places
   a block from the active hotbar slot (stored blocks are consumed first,
@@ -121,7 +121,7 @@ nothing to install and starts instantly.
   in `world_state.json`; deleting one falls back every connected browser to
   the default scene with a toast. See [API.md](API.md#worlds) for the
   scriptable `GET/POST /api/worlds` endpoint.
-- **Minecraft schematic import** — press **Shift+L** while looking at a
+- **Minecraft schematic import** — press **Right Shift+L** while looking at a
   block to load a `.schem` (Sponge/WorldEdit, versions 1–3) or legacy
   `.schematic` (MCEdit) file from disk. The structure is pasted **centered
   on the targeted block in all three axes** and rotated in 90° increments
@@ -131,10 +131,11 @@ nothing to install and starts instantly.
   engine's catalog (stairs, fences, and other shaped blocks that aren't
   full cubes — see composite objects below for the ones modeled here) fall
   back to Stone, and a summary toast plus a `console.warn` list what was
-  substituted. Capped at 64×64×64 blocks per paste. Parsing is entirely
-  client-side (a small dependency-free DEFLATE/gzip/zlib decoder and NBT
-  reader in `static/js/inflate.js` / `nbt.js`) — the backend only ever sees
-  the resulting `POST /api/edits`, same as if a player built it by hand.
+  substituted. Capped at 512 blocks per axis (width/height/length). Parsing
+  is entirely client-side (a small dependency-free DEFLATE/gzip/zlib decoder
+  and NBT reader in `static/js/inflate.js` / `nbt.js`) — the backend only
+  ever sees the resulting `POST /api/edits`, same as if a player built it
+  by hand.
 - **Composite object materials** — beyond single-color solid blocks, some
   Minecraft materials are *shapes* built from many small voxels: stairs,
   slabs, fences, panes, doors, trapdoors, pressure plates, buttons,
@@ -171,13 +172,13 @@ nothing to install and starts instantly.
 │  - chunk meshing       │   GET /api/chunk      │  worldgen.py  (Perlin)   │
 │  - pointer lock + WASD │ ───────────────────▶  │                          │
 │  - voxel raycasting    │   uint16 voxels (b64) │  scenes generate chunks  │
-│  - hotbar/inventory UI │                       │  16 × 64 × 16            │
+│  - hotbar/inventory UI │                       │  16 × 1024 × 16          │
 │                        │   POST /api/edits     │                          │
 │                        │ ───────────────────▶  │  in-memory edit store    │
 └────────────────────────┘                       └──────────────────────────┘
 ```
 
-- Chunks are `16 × 64 × 16` grids of `uint16` material ids (0 = air),
+- Chunks are `16 × 1024 × 16` grids of `uint16` material ids (0 = air),
   transferred base64-encoded and meshed client-side with face culling.
 - Sub-voxels (all sizes below 1000 mm) live in a sparse overlay keyed by
   their integer mm origin and size — `(x_mm, y_mm, z_mm, size_mm) → id` —

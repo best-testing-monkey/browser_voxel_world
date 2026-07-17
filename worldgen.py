@@ -11,7 +11,7 @@ import random
 from materials import NAME_TO_ID, GRANITE_ID
 
 CHUNK_X = 16
-CHUNK_Y = 64
+CHUNK_Y = 1024
 CHUNK_Z = 16
 
 # Voxel sizes are integers in millimetres. The base grid cell (a default

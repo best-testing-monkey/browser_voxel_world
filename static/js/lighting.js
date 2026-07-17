@@ -60,8 +60,14 @@ export function createLightEngine({ state, dims }) {
       // Unloaded/unlit neighbour: assume open sky so borders aren't black.
       return { sky: [MAX, MAX, MAX], block: [0, 0, 0] };
     }
-    const v = chunk.light[
-      (x - cx * CX) + (z - cz * CZ) * CX + y * LAYER];
+    const lx = x - cx * CX, lz = z - cz * CZ;
+    if (chunk.topY && y > chunk.topY[lx + lz * CX]) {
+      // Above the highest occupied cell in this column: open sky, and the
+      // seed pass below never bothered writing it (nothing there needs
+      // lighting — there's no geometry to sample it).
+      return { sky: [MAX, MAX, MAX], block: [0, 0, 0] };
+    }
+    const v = chunk.light[lx + lz * CX + y * LAYER];
     return {
       sky: [(v >> 20) & 15, (v >> 16) & 15, (v >> 12) & 15],
       block: [(v >> 8) & 15, (v >> 4) & 15, v & 15],
@@ -116,10 +122,21 @@ export function createLightEngine({ state, dims }) {
       const ox = chunk.cx * CX, oz = chunk.cz * CZ;
       for (let lz = 0; lz < CZ; lz++) {
         for (let lx = 0; lx < CX; lx++) {
-          // Skylight: full white from the top down to the first opaque
-          // voxel (tinted if it passes through translucent blocks).
+          const col = lx + lz * CX;
+          // Highest occupied cell in this column (-1 if entirely air).
+          // Above it is open sky with nothing to attenuate it and no
+          // geometry to ever sample a light value there, so lightAt()
+          // answers that range directly — the seed/BFS passes below only
+          // need to cover from here down, not all the way to CY - 1 (which
+          // matters once CY is far taller than any real terrain gets).
+          const top = chunk.topY ? chunk.topY[col] : CY - 1;
+          if (top < 0) continue; // fully-air column: nothing to light
+
+          // Skylight: full white from just above the terrain down to the
+          // first opaque voxel (tinted if it passes through translucent
+          // blocks).
           let s = [MAX, MAX, MAX];
-          for (let y = CY - 1; y >= 0; y--) {
+          for (let y = Math.min(CY - 1, top + 1); y >= 0; y--) {
             const info = matInfo(chunk.data[idx(lx, y, lz)]);
             if (info.opaque) break;
             if (info.tint) {
@@ -130,7 +147,8 @@ export function createLightEngine({ state, dims }) {
             skyQ.push([ox + lx, y, oz + lz, s[0], s[1], s[2]]);
           }
           // Blocklight: emissive materials seed in their own colour.
-          for (let y = 0; y < CY; y++) {
+          // Nothing above `top` is occupied, so it can't be emissive.
+          for (let y = 0; y <= top; y++) {
             const info = matInfo(chunk.data[idx(lx, y, lz)]);
             if (info.seed) {
               raiseBlock(chunk, idx(lx, y, lz), ...info.seed);
@@ -164,7 +182,11 @@ export function createLightEngine({ state, dims }) {
           const nlx = dx === 1 ? 0 : (dx === -1 ? CX - 1 : i);
           const nlz = dz === 1 ? 0 : (dz === -1 ? CZ - 1 : i);
           const wx = nb.cx * CX + nlx, wz = nb.cz * CZ + nlz;
-          for (let y = 0; y < CY; y++) {
+          // Mirror the seed pass's bound: nothing above the neighbour's
+          // occupied top ever got a light value written.
+          const nbTop = nb.topY ? nb.topY[nlx + nlz * CX] : CY - 1;
+          if (nbTop < 0) continue;
+          for (let y = 0; y <= Math.min(CY - 1, nbTop + 1); y++) {
             const v = nb.light[idx(nlx, y, nlz)];
             const sr = (v >> 20) & 15, sg = (v >> 16) & 15,
                   sb = (v >> 12) & 15;
