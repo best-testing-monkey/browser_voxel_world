@@ -80,12 +80,16 @@ class Perlin2D:
 
 
 class Scene:
-    def __init__(self, name, title, description, spawn, look=(0.785, -0.25)):
-        self.name = name
-        self.title = title
+    def __init__(self, name, title, description, spawn, look=(0.785, -0.25),
+                 builtin=False, world_type=None, params=None):
+        self.name = name          # stable id, never changes (rename-safe)
+        self.title = title        # mutable display name
         self.description = description
         self.spawn = spawn  # [x, y, z]
         self.look = look    # (yaw, pitch) radians
+        self.builtin = builtin    # True for the 3 demo scenes: no rename/delete
+        self.world_type = world_type  # "flat"|"perlin"|"single_block", or None
+        self.params = params or {}    # generator params, for persistence
         # Backend-placed blocks layered over generated terrain (screens,
         # sensors, ...): {(x, y, z): material_id}
         self.fixtures = {}
@@ -136,6 +140,9 @@ class Scene:
             "look": list(self.look),
             "chunkSize": [CHUNK_X, CHUNK_Y, CHUNK_Z],
             "pois": self.pois,
+            "builtin": self.builtin,
+            "worldType": self.world_type,
+            "params": self.params,
         }
 
 
@@ -188,6 +195,7 @@ class GraniteHills(Scene):
             "Granite Hills",
             "Rolling Perlin-noise hills carved from solid granite.",
             spawn=[8.5, 40.0, 8.5],
+            builtin=True,
         )
         self.perlin = Perlin2D(seed=1337)
         self.base_height = 22
@@ -280,6 +288,7 @@ class MaterialMuseum(Scene):
             "Every material in the catalog on display, one pillar each.",
             spawn=[48.5, 16.0, -10.0],
             look=(math.pi, -0.28),  # face the pillar lattice (+z)
+            builtin=True,
         )
         self.material_count = material_count
         self.floor_id = NAME_TO_ID["Polished Andesite"]
@@ -320,6 +329,7 @@ class GlassCathedral(Scene):
             "Glass Cathedral",
             "Interfering sine ridges of stained glass, quartz and gold.",
             spawn=[8.5, 42.0, 8.5],
+            builtin=True,
         )
         dyes = ["Red", "Orange", "Yellow", "Lime", "Cyan",
                 "Blue", "Purple", "Magenta"]
@@ -349,6 +359,114 @@ class GlassCathedral(Scene):
                         mat = self.bands[(y // 3) % len(self.bands)]
                     voxels[col + y * layer] = mat
         return voxels
+
+
+class FlatWorld(Scene):
+    """A user-created flat plain: `height` layers of one material."""
+
+    def __init__(self, name, title, material_id, height=4):
+        height = max(1, min(CHUNK_Y - 2, int(height)))
+        super().__init__(
+            name, title, f"Flat plain, {height} layers thick.",
+            spawn=[8.5, height + 2.0, 8.5],
+            world_type="flat", params={"material": material_id,
+                                       "height": height},
+        )
+        self.material_id = material_id
+        self.height = height
+
+    def generate_chunk(self, cx, cz):
+        layer = CHUNK_X * CHUNK_Z
+        voxels = [0] * (CHUNK_X * CHUNK_Y * CHUNK_Z)
+        for y in range(self.height):
+            for i in range(layer):
+                voxels[i + y * layer] = self.material_id
+        return voxels
+
+
+class PerlinWorld(Scene):
+    """A user-created Perlin-noise hill world of a chosen material —
+    the same generator as GraniteHills, parametrized instead of hardcoded."""
+
+    def __init__(self, name, title, material_id, seed=0,
+                 base_height=22, amplitude=14, scale=48):
+        super().__init__(
+            name, title, "Rolling Perlin-noise hills.",
+            spawn=[8.5, base_height + amplitude + 4.0, 8.5],
+            world_type="perlin",
+            params={"material": material_id, "seed": seed,
+                    "baseHeight": base_height, "amplitude": amplitude,
+                    "scale": scale},
+        )
+        self.material_id = material_id
+        self.perlin = Perlin2D(seed=seed)
+        self.base_height = base_height
+        self.amplitude = amplitude
+        self.scale = 1 / float(scale)
+
+    def height_at(self, wx, wz):
+        n = self.perlin.fbm(wx * self.scale, wz * self.scale, octaves=4)
+        h = self.base_height + n * self.amplitude
+        return max(1, min(CHUNK_Y - 2, int(round(h))))
+
+    def generate_chunk(self, cx, cz):
+        voxels = [0] * (CHUNK_X * CHUNK_Y * CHUNK_Z)
+        layer = CHUNK_X * CHUNK_Z
+        for z in range(CHUNK_Z):
+            for x in range(CHUNK_X):
+                wx = cx * CHUNK_X + x
+                wz = cz * CHUNK_Z + z
+                h = self.height_at(wx, wz)
+                col = x + z * CHUNK_X
+                for y in range(h + 1):
+                    voxels[col + y * layer] = self.material_id
+        return voxels
+
+
+class SingleBlockWorld(Scene):
+    """A void world containing exactly one voxel; the player spawns
+    standing on it (stepping off is the point)."""
+
+    ORIGIN = (8, 32, 8)
+
+    def __init__(self, name, title, material_id):
+        ox, oy, oz = self.ORIGIN
+        super().__init__(
+            name, title, "A single block floating in an endless void.",
+            spawn=[ox + 0.5, oy + 1.0, oz + 0.5],
+            world_type="single_block", params={"material": material_id},
+        )
+        self.material_id = material_id
+
+    def generate_chunk(self, cx, cz):
+        voxels = [0] * (CHUNK_X * CHUNK_Y * CHUNK_Z)
+        ox, oy, oz = self.ORIGIN
+        if cx == ox // CHUNK_X and cz == oz // CHUNK_Z:
+            layer = CHUNK_X * CHUNK_Z
+            lx, lz = ox - cx * CHUNK_X, oz - cz * CHUNK_Z
+            voxels[lx + lz * CHUNK_X + oy * layer] = self.material_id
+        return voxels
+
+
+WORLD_TYPES = {"flat": FlatWorld, "perlin": PerlinWorld,
+               "single_block": SingleBlockWorld}
+
+
+def build_world(world_type, name, title, params):
+    """Construct a custom (non-builtin) Scene from a type name + params
+    dict, as produced by /api/worlds or reloaded from world_state.json."""
+    cls = WORLD_TYPES[world_type]
+    material_id = params["material"]
+    if cls is FlatWorld:
+        return FlatWorld(name, title, material_id,
+                          height=params.get("height", 4))
+    if cls is PerlinWorld:
+        return PerlinWorld(name, title, material_id,
+                            seed=params.get("seed", 0),
+                            base_height=params.get("baseHeight", 22),
+                            amplitude=params.get("amplitude", 14),
+                            scale=params.get("scale", 48))
+    return SingleBlockWorld(name, title, material_id)
 
 
 def build_scenes(material_count):

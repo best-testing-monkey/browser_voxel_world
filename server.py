@@ -21,6 +21,7 @@ API:
 import argparse
 import base64
 import json
+import re
 import struct
 import threading
 import time
@@ -30,20 +31,24 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from materials import MATERIALS, NAME_TO_ID
-from worldgen import (build_scenes, DEFAULT_SCENE, CHUNK_X, CHUNK_Y, CHUNK_Z,
-                      VOXEL_SIZE_MM, MIN_VOXEL_SIZE_MM, VOXEL_SIZES_MM)
+from worldgen import (build_scenes, build_world, WORLD_TYPES, DEFAULT_SCENE,
+                      CHUNK_X, CHUNK_Y, CHUNK_Z, VOXEL_SIZE_MM,
+                      MIN_VOXEL_SIZE_MM, VOXEL_SIZES_MM)
 
 STATIC_DIR = Path(__file__).parent / "static"
 STATE_FILE = Path(__file__).parent / "world_state.json"
 
-SCENES = build_scenes(len(MATERIALS))
+# SCENES is dynamic: worlds can be created/deleted at runtime (see
+# register_scene/unregister_scene below), not just the 3 built-in demo
+# scenes assembled by build_scenes() at import time.
+SCENES = {}
 
 # Edit stores, applied on top of generated chunks and persisted to
 # STATE_FILE so world changes survive server restarts.
 #   EDITS:     {scene: {(x, y, z): material_id}}          base 1000 mm grid
 #   SUBVOXELS: {scene: {(x_mm, y_mm, z_mm, size_mm): id}}  smaller voxels
-EDITS = {name: {} for name in SCENES}
-SUBVOXELS = {name: {} for name in SCENES}
+EDITS = {}
+SUBVOXELS = {}
 EDITS_LOCK = threading.Lock()
 
 SUB_SIZES = [s for s in VOXEL_SIZES_MM if s < VOXEL_SIZE_MM]
@@ -51,14 +56,60 @@ SUB_SIZES = [s for s in VOXEL_SIZES_MM if s < VOXEL_SIZE_MM]
 # Revision log so clients can pick up changes the backend (or another
 # client) makes at runtime: every applied edit gets a revision number and
 # GET /api/updates?since=N returns the ops after N.
-REV = {name: 0 for name in SCENES}
-EDIT_LOG = {name: [] for name in SCENES}
+REV = {}
+EDIT_LOG = {}
 EDIT_LOG_MAX = 4000
 
 # Sensor event bookkeeping for the demo installation (see handle_game_event)
-SENSOR_COUNTS = {name: {"touch": 0, "light": 0, "pressure": 0}
-                 for name in SCENES}
-SENSOR_LOG = {name: [] for name in SCENES}
+SENSOR_COUNTS = {}
+SENSOR_LOG = {}
+
+# Custom (non-builtin) world definitions, persisted so they can be rebuilt
+# on restart: {name: {"title", "type", "params"}}
+WORLD_DEFS = {}
+
+
+def register_scene(scene):
+    """Add a Scene (builtin or custom) to the live registry, lazily
+    initializing all of its per-scene bookkeeping dicts."""
+    name = scene.name
+    SCENES[name] = scene
+    EDITS.setdefault(name, {})
+    SUBVOXELS.setdefault(name, {})
+    REV.setdefault(name, 0)
+    EDIT_LOG.setdefault(name, [])
+    SENSOR_COUNTS.setdefault(name, {"touch": 0, "light": 0, "pressure": 0})
+    SENSOR_LOG.setdefault(name, [])
+
+
+def unregister_scene(name):
+    """Remove a custom world and all of its bookkeeping/cache entries."""
+    SCENES.pop(name, None)
+    EDITS.pop(name, None)
+    SUBVOXELS.pop(name, None)
+    REV.pop(name, None)
+    EDIT_LOG.pop(name, None)
+    SENSOR_COUNTS.pop(name, None)
+    SENSOR_LOG.pop(name, None)
+    WORLD_DEFS.pop(name, None)
+    with CHUNK_CACHE_LOCK:
+        for key in [k for k in CHUNK_CACHE if k[0] == name]:
+            del CHUNK_CACHE[key]
+
+
+def slugify(title, existing):
+    slug = re.sub(r"[^a-z0-9]+", "_", title.strip().lower()).strip("_")
+    slug = slug or "world"
+    if slug not in existing:
+        return slug
+    n = 2
+    while f"{slug}_{n}" in existing:
+        n += 1
+    return f"{slug}_{n}"
+
+
+for _scene in build_scenes(len(MATERIALS)).values():
+    register_scene(_scene)
 
 ACTIONS = ("touch", "light", "pressure")
 MATERIAL_ACTION = {m["id"]: m.get("action") for m in MATERIALS
@@ -193,6 +244,18 @@ def load_state():
                 "speed": float(saved_time.get("speed", 4.0)),
                 "setAt": float(saved_time.get("setAt", time.time())),
             })
+    # Rebuild custom worlds BEFORE loading per-scene edits/screens below, so
+    # that loop's "if scene not in SCENES: continue" guard picks them up too.
+    for w in data.get("worlds", []):
+        try:
+            if w["type"] not in WORLD_TYPES:
+                continue
+            scene = build_world(w["type"], w["id"], w["title"], w["params"])
+            register_scene(scene)
+            WORLD_DEFS[w["id"]] = {"title": w["title"], "type": w["type"],
+                                   "params": w["params"]}
+        except (KeyError, TypeError, ValueError) as err:
+            print(f"warning: could not rebuild world {w!r}: {err}")
     for scene, stores in data.get("scenes", {}).items():
         if scene not in SCENES:
             continue
@@ -226,6 +289,7 @@ def save_state():
                     for (x, y, z, s), m in SUBVOXELS[name].items()],
             "screens": list(SCENES[name].screens.values()),
         } for name in SCENES}}
+    data["worlds"] = [{"id": name, **d} for name, d in WORLD_DEFS.items()]
     with TIME_LOCK:
         data["time"] = dict(TIME_STATE)
     tmp = STATE_FILE.with_suffix(".json.tmp")
@@ -355,6 +419,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_events_get(parse_qs(parsed.query))
         if path == "/api/time":
             return self.send_json(time_payload())
+        if path == "/api/worlds":
+            return self.handle_worlds_get()
         return self.handle_static(path)
 
     def do_POST(self):
@@ -369,6 +435,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_subscribe()
         if parsed.path == "/api/time":
             return self.handle_time_post()
+        if parsed.path == "/api/worlds":
+            return self.handle_worlds_post()
         self.send_error_json("not found", 404)
 
     def read_body_json(self):
@@ -631,6 +699,93 @@ class Handler(BaseHTTPRequestHandler):
         set_time(hours, speed)
         save_state()
         self.send_json(time_payload())
+
+    @staticmethod
+    def world_descriptor(scene):
+        return {
+            "id": scene.name,
+            "title": scene.title,
+            "type": scene.world_type,
+            "builtin": scene.builtin,
+            "spawn": scene.spawn,
+            "params": scene.params,
+        }
+
+    def handle_worlds_get(self):
+        self.send_json({
+            "worlds": [self.world_descriptor(s) for s in SCENES.values()]})
+
+    def handle_worlds_post(self):
+        try:
+            payload = self.read_body_json()
+            action = payload.get("action", "create")
+        except (ValueError, json.JSONDecodeError):
+            return self.send_error_json("bad worlds payload")
+
+        if action == "create":
+            title = payload.get("title")
+            wtype = payload.get("type")
+            params_in = payload.get("params") or {}
+            if not isinstance(title, str) or not title.strip():
+                return self.send_error_json("title is required")
+            if wtype not in WORLD_TYPES:
+                return self.send_error_json(
+                    f"type must be one of {sorted(WORLD_TYPES)}")
+            material_name = params_in.get("material")
+            if not isinstance(material_name, str) or \
+                    material_name not in NAME_TO_ID:
+                return self.send_error_json(
+                    "params.material must be a known material name")
+            params = {"material": NAME_TO_ID[material_name]}
+            try:
+                if wtype == "flat":
+                    if "height" in params_in:
+                        params["height"] = int(params_in["height"])
+                elif wtype == "perlin":
+                    for key in ("seed", "baseHeight", "amplitude", "scale"):
+                        if key in params_in:
+                            params[key] = (int(params_in[key]) if key == "seed"
+                                          else float(params_in[key]))
+            except (TypeError, ValueError):
+                return self.send_error_json("bad params")
+
+            name = slugify(title, set(SCENES))
+            scene = build_world(wtype, name, title.strip(), params)
+            register_scene(scene)
+            WORLD_DEFS[name] = {"title": title.strip(), "type": wtype,
+                                "params": params}
+            save_state()
+            return self.send_json(
+                {"ok": True, "world": self.world_descriptor(scene)})
+
+        if action == "rename":
+            name = payload.get("id")
+            title = payload.get("title")
+            scene = SCENES.get(name)
+            if scene is None:
+                return self.send_error_json(f"unknown world {name!r}", 404)
+            if scene.builtin:
+                return self.send_error_json("cannot rename a built-in world")
+            if not isinstance(title, str) or not title.strip():
+                return self.send_error_json("title is required")
+            scene.title = title.strip()
+            WORLD_DEFS[name]["title"] = scene.title
+            save_state()
+            return self.send_json(
+                {"ok": True, "world": self.world_descriptor(scene)})
+
+        if action == "delete":
+            name = payload.get("id")
+            scene = SCENES.get(name)
+            if scene is None:
+                return self.send_error_json(f"unknown world {name!r}", 404)
+            if scene.builtin:
+                return self.send_error_json("cannot delete a built-in world")
+            unregister_scene(name)
+            save_state()
+            return self.send_json({"ok": True})
+
+        return self.send_error_json(f"unknown action {action!r}")
 
     def handle_subscribe(self):
         try:
