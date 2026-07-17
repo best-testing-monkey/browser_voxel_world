@@ -131,11 +131,14 @@ nothing to install and starts instantly.
   engine's catalog (stairs, fences, and other shaped blocks that aren't
   full cubes — see composite objects below for the ones modeled here) fall
   back to Stone, and a summary toast plus a `console.warn` list what was
-  substituted. Capped at 512 blocks per axis (width/height/length). Parsing
-  is entirely client-side (a small dependency-free DEFLATE/gzip/zlib decoder
-  and NBT reader in `static/js/inflate.js` / `nbt.js`) — the backend only
-  ever sees the resulting `POST /api/edits`, same as if a player built it
-  by hand.
+  substituted. Capped at 512 blocks per axis (width/height/length).
+  Decompression, NBT parsing, block-name resolution, and placement all run
+  **server-side** (`schematic_import.py`) as a background job, so loading a
+  large structure never blocks the browser tab — the client just uploads
+  the raw file to `POST /api/schematic/import` and polls
+  `GET /api/schematic/status` for progress (see
+  [API.md](API.md#schematic-import)). Every connected client (not just the
+  one that uploaded it) picks up the result within one poll cycle.
 - **Composite object materials** — beyond single-color solid blocks, some
   Minecraft materials are *shapes* built from many small voxels: stairs,
   slabs, fences, panes, doors, trapdoors, pressure plates, buttons,
@@ -197,13 +200,12 @@ nothing to install and starts instantly.
 
 | Path | Purpose |
 | --- | --- |
-| `server.py` | HTTP server: static files + JSON API (`/api/config`, `/api/chunk`, `/api/edits`, `/api/worlds`) |
+| `server.py` | HTTP server: static files + JSON API (`/api/config`, `/api/chunk`, `/api/edits`, `/api/worlds`, `/api/schematic/*`) |
 | `materials.py` | Builds the 1024+ material catalog, including composite object materials |
 | `worldgen.py` | Perlin noise, the built-in scenes, and the Flat/Perlin/SingleBlock world generators |
+| `schematic_import.py` | Server-side `.schem`/`.schematic` parsing, block mapping, and placement (background job) |
 | `objects/*.txt` | Composite object shape definitions (stairs, fences, panes, torches, ...) |
 | `static/index.html` | UI shell: HUD, hotbar, material browser, inventory, world manager |
 | `static/js/main.js` | Game client: streaming, meshing, controls, editing, world manager UI |
-| `static/js/inflate.js` | Dependency-free DEFLATE/gzip/zlib decoder for schematic files |
-| `static/js/nbt.js` | Minecraft NBT (Named Binary Tag) reader |
-| `static/js/schematic.js` | `.schem` / `.schematic` parsing, block mapping, and placement math |
+| `static/js/schematic.js` | Footprint-rotation helpers shared by composite object placement |
 | `static/vendor/three.module.js` | Vendored Three.js r160 |

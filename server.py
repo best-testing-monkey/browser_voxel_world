@@ -16,6 +16,9 @@ API:
   GET  /api/config                     -> materials, scenes, chunk size, default scene
   GET  /api/chunk?scene=S&cx=N&cz=N    -> one chunk of voxel data (base64 uint16 LE)
   POST /api/edits                      -> persist block edits {scene, edits:[{x,y,z,id}]}
+  POST /api/schematic/import?scene=S&tx=&ty=&tz=&nx=&ny=&nz= (raw file body)
+                                        -> {jobId} — background import, see schematic_import.py
+  GET  /api/schematic/status?jobId=ID  -> {status, processed, total, result|error}
 """
 
 import argparse
@@ -26,10 +29,12 @@ import struct
 import threading
 import time
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import schematic_import
 from materials import MATERIALS, NAME_TO_ID
 from worldgen import (build_scenes, build_world, WORLD_TYPES, DEFAULT_SCENE,
                       CHUNK_X, CHUNK_Y, CHUNK_Z, VOXEL_SIZE_MM,
@@ -67,6 +72,15 @@ SENSOR_LOG = {}
 # Custom (non-builtin) world definitions, persisted so they can be rebuilt
 # on restart: {name: {"title", "type", "params"}}
 WORLD_DEFS = {}
+
+# Schematic import jobs (see /api/schematic/import|status): parsing/placing
+# a large file can take a while, so it runs in a background thread while
+# the client polls for progress — {job_id: {"status", "processed", "total",
+# "result", "error"}}. Not persisted; a server restart drops in-flight jobs.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOBS_MAX = 50  # trim oldest entries beyond this so JOBS doesn't grow forever
+MAX_SCHEMATIC_UPLOAD_BYTES = 64 * 1024 * 1024
 
 
 def register_scene(scene):
@@ -219,6 +233,66 @@ def record_edit(scene, op):
     log.append({"rev": REV[scene], **op})
     if len(log) > EDIT_LOG_MAX:
         del log[:len(log) - EDIT_LOG_MAX]
+
+
+def _trim_jobs():
+    with JOBS_LOCK:
+        if len(JOBS) > JOBS_MAX:
+            for old_id in list(JOBS)[:len(JOBS) - JOBS_MAX]:
+                del JOBS[old_id]
+
+
+def _run_schematic_job(job, scene, target, normal, raw_bytes):
+    """Background-thread worker for a schematic import: parses/places the
+    file (the potentially slow part, run without holding EDITS_LOCK so it
+    doesn't block other players/requests), then does one bulk write into
+    EDITS[scene] under the lock."""
+    def progress_cb(processed, total):
+        with JOBS_LOCK:
+            job["processed"] = processed
+            job["total"] = total
+
+    try:
+        edits, unmapped, bbox = schematic_import.parse_and_place(
+            raw_bytes, NAME_TO_ID, target, normal, CHUNK_Y, progress_cb)
+    except schematic_import.SchematicTooLarge as e:
+        with JOBS_LOCK:
+            job["status"] = "error"
+            job["error"] = str(e)
+        return
+    except Exception as e:
+        with JOBS_LOCK:
+            job["status"] = "error"
+            job["error"] = f"could not parse schematic: {e}"
+        return
+
+    applied = 0
+    with EDITS_LOCK:
+        store = EDITS.get(scene)
+        if store is None:
+            with JOBS_LOCK:
+                job["status"] = "error"
+                job["error"] = "scene no longer exists"
+            return
+        store.update(edits)
+        applied = len(edits)
+        # One "bulk" marker (with the affected bounding box) instead of one
+        # log entry per cell — a large import can be millions of cells, and
+        # the log is capped (and /api/updates only returns 500/poll), so
+        # per-cell logging would make large imports take an impractically
+        # long time to sync via the normal incremental-edit mechanism.
+        # Clients treat "bulk" as "go refetch any of my loaded chunks that
+        # intersect this box" instead of replaying it cell by cell.
+        if applied:
+            record_edit(scene, {"op": "bulk", "bbox": list(bbox)})
+    if applied:
+        save_state()
+
+    with JOBS_LOCK:
+        job["status"] = "done"
+        job["processed"] = job["total"]
+        job["result"] = {"cells": applied, "unmapped": unmapped,
+                         "bbox": list(bbox)}
 
 
 def backend_set_block(scene, x, y, z, mat):
@@ -421,6 +495,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(time_payload())
         if path == "/api/worlds":
             return self.handle_worlds_get()
+        if path == "/api/schematic/status":
+            return self.handle_schematic_status(parse_qs(parsed.query))
         return self.handle_static(path)
 
     def do_POST(self):
@@ -437,11 +513,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_time_post()
         if parsed.path == "/api/worlds":
             return self.handle_worlds_post()
+        if parsed.path == "/api/schematic/import":
+            return self.handle_schematic_import(parse_qs(parsed.query))
         self.send_error_json("not found", 404)
 
     def read_body_json(self):
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(min(length, 1 << 20)) or b"{}")
+
+    def read_body_raw(self, max_bytes):
+        """Like read_body_json but for a raw (non-JSON) body, with a
+        caller-supplied size cap. Returns None if Content-Length is
+        missing/invalid, zero, or exceeds max_bytes."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if length <= 0 or length > max_bytes:
+            return None
+        return self.rfile.read(length)
 
     # ---- API handlers ----
     def handle_config(self):
@@ -786,6 +876,48 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True})
 
         return self.send_error_json(f"unknown action {action!r}")
+
+    def handle_schematic_import(self, query):
+        scene = query.get("scene", [DEFAULT_SCENE])[0]
+        if scene not in SCENES:
+            return self.send_error_json(f"unknown scene {scene!r}", 404)
+        try:
+            tx = int(query["tx"][0])
+            ty = int(query["ty"][0])
+            tz = int(query["tz"][0])
+            nx = float(query["nx"][0])
+            ny = float(query["ny"][0])
+            nz = float(query["nz"][0])
+        except (KeyError, IndexError, ValueError):
+            return self.send_error_json("tx/ty/tz/nx/ny/nz are required")
+
+        raw_bytes = self.read_body_raw(MAX_SCHEMATIC_UPLOAD_BYTES)
+        if raw_bytes is None:
+            mb = MAX_SCHEMATIC_UPLOAD_BYTES // (1 << 20)
+            return self.send_error_json(f"upload must be 1-{mb} MiB", 413)
+
+        job_id = uuid.uuid4().hex
+        job = {"status": "running", "processed": 0, "total": 0,
+              "result": None, "error": None}
+        with JOBS_LOCK:
+            JOBS[job_id] = job
+        _trim_jobs()
+
+        target = {"x": tx, "y": ty, "z": tz}
+        normal = {"x": nx, "y": ny, "z": nz}
+        threading.Thread(target=_run_schematic_job,
+                         args=(job, scene, target, normal, raw_bytes),
+                         daemon=True).start()
+        self.send_json({"jobId": job_id})
+
+    def handle_schematic_status(self, query):
+        job_id = query.get("jobId", [None])[0]
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is None:
+                return self.send_error_json("unknown job", 404)
+            out = dict(job)
+        self.send_json(out)
 
     def handle_subscribe(self):
         try:

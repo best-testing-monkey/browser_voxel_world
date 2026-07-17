@@ -38,7 +38,47 @@ material ids (0 = air) for the 1000 mm base grid, `subvoxels` is a list of
 ### `GET /api/updates?scene=S&since=REV`
 Everything that changed after revision `REV`: world edits (same op format),
 current screen versions, and the latest event sequence number. Poll this to
-mirror world state.
+mirror world state. A completed schematic import (see below) shows up as a
+single `{"op": "bulk", "bbox": [...]}` entry rather than one edit per cell.
+
+## Schematic import
+
+Load a Minecraft `.schem` (Sponge/WorldEdit, versions 1–3) or legacy
+`.schematic` (MCEdit) file and paste it into the world, centered on a
+target block. Decompression, NBT parsing, block-name resolution, and
+placement all run server-side (`schematic_import.py`) as a background job,
+since a large structure can take a while to process — upload the file,
+then poll for progress.
+
+### `POST /api/schematic/import?scene=S&tx=&ty=&tz=&nx=&ny=&nz=`
+Body: the raw file bytes (gzip-, zlib-compressed, or raw NBT — whatever the
+file is on disk), up to 64 MiB.
+
+- `tx,ty,tz`: the target block (integers, base grid) — the schematic is
+  centered on this cell in all three axes.
+- `nx,ny,nz`: the outward face normal at the target (e.g. `0,1,0` for a
+  floor hit) — determines the 90°-increment rotation (a floor/ceiling hit
+  keeps the structure unrotated).
+
+Response: `{"jobId": "..."}` immediately; parsing/placing continues in a
+background thread.
+
+### `GET /api/schematic/status?jobId=ID`
+```json
+{"status": "running", "processed": 128000, "total": 216000,
+ "result": null, "error": null}
+```
+`status` is `"running"`, `"done"`, or `"error"`. When `"done"`, `result` is
+`{"cells": N, "unmapped": [...], "bbox": [x0, y0, z0, x1, y1, z1]}` —
+`unmapped` lists block names/legacy ids with no catalog equivalent (they
+fell back to Stone); `bbox` is the half-open world-space region touched.
+When `"error"`, `error` explains why (e.g. exceeding the 512-per-axis
+dimension cap, or an unrecognized file format).
+
+Placement is written directly into the scene's edit store — same effect as
+many `POST /api/edits` calls, including replacing existing voxels with air
+where the schematic has air — and persists to `world_state.json` like any
+other edit.
 
 ## Worlds
 

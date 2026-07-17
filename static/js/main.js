@@ -2,8 +2,7 @@ import * as THREE from '/vendor/three.module.js';
 import { createScreenManager } from '/js/screens.js';
 import { createFluidSim } from '/js/fluids.js';
 import { createLightEngine } from '/js/lighting.js';
-import { parseSchematic, placeSchematic, rotateAndNormalize, stepsFromNormal,
-  MAX_SCHEMATIC_DIM } from '/js/schematic.js';
+import { rotateAndNormalize, stepsFromNormal } from '/js/schematic.js';
 
 // ---------------------------------------------------------------------------
 // Config & state
@@ -482,6 +481,14 @@ function rebuildChunk(chunk) {
   // Also refresh the 50 mm occupancy set used by the fluid simulation.
   chunk.subCells = new Set();
   for (const sv of chunk.sub.values()) {
+    // A sub-voxel's containing cell also needs a correct light value (its
+    // faces sample it below), even when it sits above the highest *base*
+    // voxel in this column — e.g. a torch or any object placed on top of
+    // the terrain. Extend topY (see the base-grid loop above) so the light
+    // engine doesn't wrongly treat that cell as untouched open sky.
+    const svBlockY = Math.floor(sv.y / MM);
+    const svCol = (Math.floor(sv.x / MM) - ox) + (Math.floor(sv.z / MM) - oz) * CX;
+    if (svBlockY > chunk.topY[svCol]) chunk.topY[svCol] = svBlockY;
     // Sub-voxels sample the light of their containing 1 m cell.
     const cellLight = faceLight(
       Math.floor(sv.x / MM), Math.floor(sv.y / MM), Math.floor(sv.z / MM));
@@ -727,15 +734,13 @@ function placeObject(mat, t) {
 }
 
 // ---------------------------------------------------------------------------
-// Schematic import: Right Shift+L captures the current target, then loads a
-// Minecraft .schem/.schematic file centered on it (see schematic.js).
+// Schematic import: Right Shift+L captures the current target, then uploads
+// a Minecraft .schem/.schematic file for the backend to parse and place
+// (schematic_import.py, via POST /api/schematic/import). Parsing/placing a
+// large structure can take a while, so it runs as a background job on the
+// server while this client just polls GET /api/schematic/status for
+// progress — nothing here blocks the main thread regardless of file size.
 // ---------------------------------------------------------------------------
-let nameToIdMap = null;
-function buildNameToIdMap() {
-  nameToIdMap = new Map();
-  for (const m of state.materials) if (m) nameToIdMap.set(m.name, m.id);
-}
-
 let capturedSchemTarget = null;
 
 function startSchematicLoad() {
@@ -753,34 +758,86 @@ function startSchematicLoad() {
   input.click();
 }
 
+// Refetch only the currently-loaded chunks intersecting a bulk edit's
+// bounding box, so a backend-side bulk change (this client's own import, or
+// another client's via applyRemoteEdit's "bulk" branch below) shows up
+// immediately instead of waiting on the incremental edit-log poll (which
+// isn't designed to replay millions of cells). Deliberately scoped to the
+// affected box rather than every loaded chunk — refetching (and therefore
+// re-meshing) dozens of unrelated chunks is itself slow enough to freeze
+// the tab for seconds once CY is as tall as it is now.
+function refreshChunksInBbox(bbox) {
+  const [x0, , z0, x1, , z1] = bbox;
+  const cx0 = Math.floor(x0 / CX), cx1 = Math.floor((x1 - 1) / CX);
+  const cz0 = Math.floor(z0 / CZ), cz1 = Math.floor((z1 - 1) / CZ);
+  for (let cz = cz0; cz <= cz1; cz++) {
+    for (let cx = cx0; cx <= cx1; cx++) {
+      if (state.chunks.has(chunkKey(cx, cz))) fetchChunk(cx, cz);
+    }
+  }
+}
+
+async function pollSchematicJob(jobId, fileName) {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 500));
+    let status;
+    try {
+      const res = await fetch(`/api/schematic/status?jobId=${jobId}`);
+      if (!res.ok) {
+        showToast(`Lost track of ${fileName} import`);
+        return;
+      }
+      status = await res.json();
+    } catch {
+      continue; // transient network error; keep polling
+    }
+    if (status.status === 'running') {
+      const pct = status.total
+        ? Math.floor((status.processed / status.total) * 100) : 0;
+      showToast(`Loading ${fileName}: ${pct}%`);
+      continue;
+    }
+    if (status.status === 'error') {
+      showToast(`Could not load ${fileName}: ${status.error}`);
+      return;
+    }
+    refreshChunksInBbox(status.result.bbox);
+    const { cells, unmapped } = status.result;
+    let msg = `Placed ${fileName}: ${cells} blocks`;
+    if (unmapped.length) {
+      msg += ` (${unmapped.length} unknown block type` +
+        `${unmapped.length === 1 ? '' : 's'} defaulted to Stone)`;
+      console.warn('Unmapped schematic blocks:', unmapped);
+    }
+    showToast(msg);
+    return;
+  }
+}
+
 async function handleSchemFileChange(e) {
   const file = e.target.files[0];
   const target = capturedSchemTarget;
   capturedSchemTarget = null;
   if (!file || !target) return;
-  showToast(`Loading ${file.name}…`);
+  showToast(`Uploading ${file.name}…`);
   try {
-    if (!nameToIdMap) buildNameToIdMap();
     const buf = await file.arrayBuffer();
-    const parsed = parseSchematic(buf, nameToIdMap);
-    if (parsed.width > MAX_SCHEMATIC_DIM || parsed.height > MAX_SCHEMATIC_DIM ||
-        parsed.length > MAX_SCHEMATIC_DIM) {
-      showToast(`Schematic too large (${parsed.width}×${parsed.height}` +
-        `×${parsed.length}) — max ${MAX_SCHEMATIC_DIM} per axis`);
-      return;
+    const { x: tx, y: ty, z: tz } = target.base;
+    const { x: nx, y: ny, z: nz } = target.normal;
+    const qs = `scene=${state.scene.name}&tx=${tx}&ty=${ty}&tz=${tz}` +
+      `&nx=${nx}&ny=${ny}&nz=${nz}`;
+    const res = await fetch(`/api/schematic/import?${qs}`,
+      { method: 'POST', body: buf });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      showToast(`Could not load ${file.name}: ${body.error || res.status}`);
+    } else {
+      const { jobId } = await res.json();
+      pollSchematicJob(jobId, file.name);
     }
-    const worldCells = placeSchematic(parsed, target.base, target.normal, CY);
-    applyVoxelCells(worldCells, MM);
-    let msg = `Placed ${file.name}: ${worldCells.length} blocks`;
-    if (parsed.unmapped.length) {
-      msg += ` (${parsed.unmapped.length} unknown block type` +
-        `${parsed.unmapped.length === 1 ? '' : 's'} defaulted to Stone)`;
-      console.warn('Unmapped schematic blocks:', parsed.unmapped);
-    }
-    showToast(msg);
   } catch (err) {
-    console.error('schematic load failed', err);
-    showToast('Could not load schematic: ' + err.message);
+    console.error('schematic upload failed', err);
+    showToast('Could not upload schematic: ' + err.message);
   }
   renderer.domElement.requestPointerLock();
 }
@@ -1232,6 +1289,12 @@ function applyRemoteEdit(e) {
     const cur = chunk.sub.get(subKey(e.x, e.y, e.z, e.s));
     const same = e.id === 0 ? !cur : (cur && cur.mat === e.id);
     if (!same) setSubVoxel(e.x, e.y, e.z, e.s, e.id, true, false);
+  } else if (e.op === 'bulk') {
+    // A schematic import (by this client or another) applied many cells in
+    // one server-side write, logged as a single marker instead of one
+    // entry per cell — refetch the affected chunks instead of trying to
+    // replay it cell by cell.
+    refreshChunksInBbox(e.bbox);
   }
 }
 
