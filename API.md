@@ -40,6 +40,63 @@ Everything that changed after revision `REV`: world edits (same op format),
 current screen versions, and the latest event sequence number. Poll this to
 mirror world state.
 
+## Worlds
+
+Beyond the three built-in scenes (Granite Hills, Material Museum, Glass
+Cathedral — read-only, can't be renamed or deleted), you can create your own
+worlds from three generator types.
+
+### `GET /api/worlds`
+```json
+{"worlds": [
+  {"id": "granite_hills", "title": "Granite Hills", "type": null,
+   "builtin": true, "spawn": [8.5, 33.0, 8.5], "params": {}},
+  {"id": "my_flat_world", "title": "My Flat World", "type": "flat",
+   "builtin": false, "spawn": [8.5, 6.0, 8.5],
+   "params": {"material": 90, "height": 4}}
+]}
+```
+`id` is the stable scene name used everywhere else (`scene=` on
+`/api/chunk`, `/api/edits`, `/api/updates`, ...) — renaming a world never
+changes it.
+
+### `POST /api/worlds` — create / rename / delete
+Create:
+```json
+{"action": "create", "title": "My Flat World", "type": "flat",
+ "params": {"material": "Grass Block", "height": 4}}
+```
+- `type: "flat"` — `params: {material, height}` (height in blocks, default
+  4): every chunk is `height` layers of `material` over air.
+- `type: "perlin"` — `params: {material, seed, amplitude}`: rolling hills
+  of `material`, generalizing Granite Hills' generator.
+- `type: "single_block"` — `params: {material}`: exactly one voxel at a
+  fixed origin in an otherwise empty void; you spawn standing on it.
+
+`material` must be a material name string (validated against the catalog —
+unknown/missing names 400); the server resolves and stores it as an id, as
+shown in the `GET /api/worlds` example above. The server slugifies `title`
+into a unique `id`
+(lowercase, non-alphanumeric → `_`, collisions get a numeric suffix).
+Response: `{"ok": true, "world": {...}}` (same shape as a `GET /api/worlds`
+entry).
+
+Rename:
+```json
+{"action": "rename", "id": "my_flat_world", "title": "New Title"}
+```
+Only `title` changes — chunk/edit storage keeps using `id`.
+
+Delete:
+```json
+{"action": "delete", "id": "my_flat_world"}
+```
+Drops the world's edits and chunk cache. Any client still viewing a
+deleted world falls back to the default scene on its next poll.
+
+All three actions return **400** if `id` refers to a built-in scene or an
+unknown id.
+
 ## Screens
 
 Screens are panels of Screen voxels the backend draws on. Content types:

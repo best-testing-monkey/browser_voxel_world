@@ -1236,7 +1236,21 @@ async function pollUpdates() {
   try {
     const res = await fetch(
       `/api/updates?scene=${sceneName}&since=${state.rev}`);
-    if (!res.ok) return;
+    if (!res.ok) {
+      // The active world may have been deleted (by this client's own delete
+      // action, another client, or a direct API call) — fall back to the
+      // default scene rather than leaving the client polling/fetching
+      // chunks for a scene that no longer exists.
+      if (res.status === 404 && state.scene && state.scene.name === sceneName) {
+        const fallback = state.config.scenes.find(
+          (m) => m.name === state.config.defaultScene) || state.config.scenes[0];
+        if (fallback && fallback.name !== sceneName) {
+          showToast('Current world was deleted — switched to default');
+          activateScene(fallback);
+        }
+      }
+      return;
+    }
     const p = await res.json();
     if (!state.scene || state.scene.name !== sceneName) return;
     state.rev = p.rev;

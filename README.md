@@ -106,6 +106,60 @@ nothing to install and starts instantly.
     granite. The Perlin noise is generated server-side in pure Python.
   - **Material Museum**: every one of the 1024 materials on a pillar.
   - **Glass Cathedral**: interfering sine ridges of stained glass and gold.
+- **World management** — press **M** to create, rename, and delete your own
+  worlds, alongside the three built-in scenes above (which can't be renamed
+  or deleted). Three generator types:
+  - **Flat plain**: a chosen material, N blocks thick, over an otherwise
+    empty void.
+  - **Perlin noise**: rolling hills of a chosen material, with adjustable
+    seed and amplitude (a generalization of Granite Hills' generator).
+  - **Single block in a void**: exactly one voxel, and nothing else — you
+    spawn standing on top of it, in open air, so falling off is the point.
+
+  Renaming only changes a world's display title; its underlying id (used for
+  chunk/edit storage) never changes. Custom worlds persist across restarts
+  in `world_state.json`; deleting one falls back every connected browser to
+  the default scene with a toast. See [API.md](API.md#worlds) for the
+  scriptable `GET/POST /api/worlds` endpoint.
+- **Minecraft schematic import** — press **Shift+L** while looking at a
+  block to load a `.schem` (Sponge/WorldEdit, versions 1–3) or legacy
+  `.schematic` (MCEdit) file from disk. The structure is pasted **centered
+  on the targeted block in all three axes** and rotated in 90° increments
+  to face away from the surface you clicked (a floor/ceiling hit keeps it
+  unrotated); existing voxels in the pasted volume are replaced, including
+  with air where the schematic has air. Blocks with no equivalent in this
+  engine's catalog (stairs, fences, and other shaped blocks that aren't
+  full cubes — see composite objects below for the ones modeled here) fall
+  back to Stone, and a summary toast plus a `console.warn` list what was
+  substituted. Capped at 64×64×64 blocks per paste. Parsing is entirely
+  client-side (a small dependency-free DEFLATE/gzip/zlib decoder and NBT
+  reader in `static/js/inflate.js` / `nbt.js`) — the backend only ever sees
+  the resulting `POST /api/edits`, same as if a player built it by hand.
+- **Composite object materials** — beyond single-color solid blocks, some
+  Minecraft materials are *shapes* built from many small voxels: stairs,
+  slabs, fences, panes, doors, trapdoors, pressure plates, buttons,
+  torches, lanterns, chains, ladders, and poles. Each is defined in
+  `objects/{slug}.txt` (e.g. `objects/oak_stairs.txt`) as a simple list of
+  colored cells in **10 mm units**:
+  ```
+  # X Y Z RRGGBB
+  10 15 20 FF0000
+  11 15 20 00FF00
+  ```
+  Alpha is optional (`RRGGBBAA`); `00` skips the cell entirely, anything
+  else is treated as solid. Cell colors are resolved to catalog "swatch"
+  materials (reusing an existing material if the color matches exactly),
+  and torches/lanterns propagate their emissive glow and glass panes their
+  translucency onto those swatches. Objects place like any other material —
+  right-click puts them in the normal adjacent cell — but decompose
+  immediately into their constituent sub-voxels, individually minable like
+  any other voxel, and always consume exactly one inventory unit regardless
+  of how many cells make up the shape. If an object's `.txt` file is
+  missing, it still appears in the material browser but placing it shows a
+  toast and logs a console error instead of doing anything. Colored
+  variant families (carpet/bed/banner/candle × 16 dye colors) aren't
+  authored as objects in this pass — only the 14 shapes above ship by
+  default; adding more just means dropping in another `.txt` file.
 
 ## Architecture
 
@@ -142,9 +196,13 @@ nothing to install and starts instantly.
 
 | Path | Purpose |
 | --- | --- |
-| `server.py` | HTTP server: static files + JSON API (`/api/config`, `/api/chunk`, `/api/edits`) |
-| `materials.py` | Builds the 1024+ material catalog |
-| `worldgen.py` | Perlin noise + the scene generators |
-| `static/index.html` | UI shell: HUD, hotbar, material browser, inventory |
-| `static/js/main.js` | Game client: streaming, meshing, controls, editing |
+| `server.py` | HTTP server: static files + JSON API (`/api/config`, `/api/chunk`, `/api/edits`, `/api/worlds`) |
+| `materials.py` | Builds the 1024+ material catalog, including composite object materials |
+| `worldgen.py` | Perlin noise, the built-in scenes, and the Flat/Perlin/SingleBlock world generators |
+| `objects/*.txt` | Composite object shape definitions (stairs, fences, panes, torches, ...) |
+| `static/index.html` | UI shell: HUD, hotbar, material browser, inventory, world manager |
+| `static/js/main.js` | Game client: streaming, meshing, controls, editing, world manager UI |
+| `static/js/inflate.js` | Dependency-free DEFLATE/gzip/zlib decoder for schematic files |
+| `static/js/nbt.js` | Minecraft NBT (Named Binary Tag) reader |
+| `static/js/schematic.js` | `.schem` / `.schematic` parsing, block mapping, and placement math |
 | `static/vendor/three.module.js` | Vendored Three.js r160 |
