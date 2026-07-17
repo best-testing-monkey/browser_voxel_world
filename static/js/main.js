@@ -722,7 +722,7 @@ function placeObject(mat, t) {
 }
 
 // ---------------------------------------------------------------------------
-// Schematic import: Shift+L captures the current target, then loads a
+// Schematic import: Right Shift+L captures the current target, then loads a
 // Minecraft .schem/.schematic file centered on it (see schematic.js).
 // ---------------------------------------------------------------------------
 let nameToIdMap = null;
@@ -1585,7 +1585,7 @@ document.addEventListener('keydown', (e) => {
     openWorldModal();
     return;
   }
-  if (e.shiftKey && e.code === 'KeyL' && !anyModalOpen()) {
+  if (e.code === 'KeyL' && state.keys.has('ShiftRight') && !anyModalOpen()) {
     startSchematicLoad();
     return;
   }
@@ -1607,7 +1607,7 @@ document.addEventListener('keydown', (e) => {
       state.mode = state.mode === 'fly' ? 'walk' : 'fly';
       state.vy = 0;
       showToast(state.mode === 'fly'
-        ? 'Fly mode — Space/Shift for up/down'
+        ? 'Fly mode — Space/LShift for up/down'
         : 'Walk mode — gravity on, Space to jump');
       state.lastSpaceTap = 0;
     } else {
@@ -1728,7 +1728,7 @@ function updateMovement(dt) {
 
   if (flying) {
     if (state.keys.has('Space')) move.y += 1;
-    if (state.keys.has('ShiftLeft') || state.keys.has('ShiftRight')) {
+    if (state.keys.has('ShiftLeft')) {
       move.y -= 1;
     }
     if (move.lengthSq() > 0) {

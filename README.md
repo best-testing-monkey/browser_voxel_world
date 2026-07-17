@@ -32,7 +32,7 @@ nothing to install and starts instantly.
 - **WASD** movement, **mouse look** (pointer lock), hold F to sprint.
   You start in **walk mode**: gravity pulls you down, Space jumps, and
   WASD still steers mid-air. **Double-tap Space** to toggle **fly mode**
-  (Space/Shift for up/down, no gravity).
+  (Space/Left Shift for up/down, no gravity).
 - **Create / Destroy / Store blocks**: left click mines the targeted voxel
   and stores it in your inventory (press **Q** to view), right click places
   a block from the active hotbar slot (stored blocks are consumed first,
@@ -121,7 +121,7 @@ nothing to install and starts instantly.
   in `world_state.json`; deleting one falls back every connected browser to
   the default scene with a toast. See [API.md](API.md#worlds) for the
   scriptable `GET/POST /api/worlds` endpoint.
-- **Minecraft schematic import** — press **Shift+L** while looking at a
+- **Minecraft schematic import** — press **Right Shift+L** while looking at a
   block to load a `.schem` (Sponge/WorldEdit, versions 1–3) or legacy
   `.schematic` (MCEdit) file from disk. The structure is pasted **centered
   on the targeted block in all three axes** and rotated in 90° increments
