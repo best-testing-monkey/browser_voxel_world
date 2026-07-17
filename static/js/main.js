@@ -1566,7 +1566,7 @@ function closeModals() {
 document.addEventListener('keydown', (e) => {
   if (!state.started) return;
 
-  if (e.code === 'KeyE' && !matModal.classList.contains('visible')) {
+  if (e.code === 'KeyE' && !anyModalOpen()) {
     e.preventDefault();
     closeModals();
     document.exitPointerLock();
