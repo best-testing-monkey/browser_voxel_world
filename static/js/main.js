@@ -2,8 +2,8 @@ import * as THREE from '/vendor/three.module.js';
 import { createScreenManager } from '/js/screens.js';
 import { createFluidSim } from '/js/fluids.js';
 import { createLightEngine } from '/js/lighting.js';
-import { parseSchematic, placeSchematic, rotateAndNormalize, stepsFromNormal }
-  from '/js/schematic.js';
+import { parseSchematic, placeSchematic, rotateAndNormalize, stepsFromNormal,
+  MAX_SCHEMATIC_DIM } from '/js/schematic.js';
 
 // ---------------------------------------------------------------------------
 // Config & state
@@ -450,14 +450,19 @@ function rebuildChunk(chunk) {
   };
 
   // Base grid: full 1000 mm voxels with neighbour face culling. While we
-  // scan, collect lamps and fluid faucets for the light/fluid systems.
+  // scan, collect lamps and fluid faucets for the light/fluid systems, and
+  // (since y ascends) the highest occupied cell per column — the light
+  // engine uses this to skip scanning empty sky far above the terrain,
+  // which matters once CY is much taller than any real terrain gets.
   chunk.lamps = [];
   chunk.faucets = [];
+  chunk.topY = new Int16Array(layer).fill(-1);
   for (let y = 0; y < CY; y++) {
     for (let z = 0; z < CZ; z++) {
       for (let x = 0; x < CX; x++) {
         const matId = chunk.data[x + z * CX + y * layer];
         if (!matId) continue;
+        chunk.topY[x + z * CX] = y;
         const wx = ox + x, wz = oz + z;
         const action = state.materials[matId] && state.materials[matId].action;
         if (action === 'lamp') chunk.lamps.push({ x: wx, y, z: wz });
@@ -758,10 +763,10 @@ async function handleSchemFileChange(e) {
     if (!nameToIdMap) buildNameToIdMap();
     const buf = await file.arrayBuffer();
     const parsed = parseSchematic(buf, nameToIdMap);
-    const totalCells = parsed.width * parsed.height * parsed.length;
-    if (totalCells > 64 * 64 * 64) {
+    if (parsed.width > MAX_SCHEMATIC_DIM || parsed.height > MAX_SCHEMATIC_DIM ||
+        parsed.length > MAX_SCHEMATIC_DIM) {
       showToast(`Schematic too large (${parsed.width}×${parsed.height}` +
-        `×${parsed.length}) — max 64³`);
+        `×${parsed.length}) — max ${MAX_SCHEMATIC_DIM} per axis`);
       return;
     }
     const worldCells = placeSchematic(parsed, target.base, target.normal, CY);

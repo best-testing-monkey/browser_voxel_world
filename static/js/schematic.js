@@ -10,7 +10,7 @@
 import { inflateAuto } from '/js/inflate.js';
 import { parseNbt } from '/js/nbt.js';
 
-export const MAX_SCHEMATIC_CELLS = 64 * 64 * 64; // 262,144
+export const MAX_SCHEMATIC_DIM = 512; // max width/height/length, each axis
 
 // ---------------------------------------------------------------------------
 // Shared rotation/placement math (also used by object placement in main.js)

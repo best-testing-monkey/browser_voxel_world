@@ -131,10 +131,11 @@ nothing to install and starts instantly.
   engine's catalog (stairs, fences, and other shaped blocks that aren't
   full cubes — see composite objects below for the ones modeled here) fall
   back to Stone, and a summary toast plus a `console.warn` list what was
-  substituted. Capped at 64×64×64 blocks per paste. Parsing is entirely
-  client-side (a small dependency-free DEFLATE/gzip/zlib decoder and NBT
-  reader in `static/js/inflate.js` / `nbt.js`) — the backend only ever sees
-  the resulting `POST /api/edits`, same as if a player built it by hand.
+  substituted. Capped at 512 blocks per axis (width/height/length). Parsing
+  is entirely client-side (a small dependency-free DEFLATE/gzip/zlib decoder
+  and NBT reader in `static/js/inflate.js` / `nbt.js`) — the backend only
+  ever sees the resulting `POST /api/edits`, same as if a player built it
+  by hand.
 - **Composite object materials** — beyond single-color solid blocks, some
   Minecraft materials are *shapes* built from many small voxels: stairs,
   slabs, fences, panes, doors, trapdoors, pressure plates, buttons,
@@ -171,13 +172,13 @@ nothing to install and starts instantly.
 │  - chunk meshing       │   GET /api/chunk      │  worldgen.py  (Perlin)   │
 │  - pointer lock + WASD │ ───────────────────▶  │                          │
 │  - voxel raycasting    │   uint16 voxels (b64) │  scenes generate chunks  │
-│  - hotbar/inventory UI │                       │  16 × 64 × 16            │
+│  - hotbar/inventory UI │                       │  16 × 1024 × 16          │
 │                        │   POST /api/edits     │                          │
 │                        │ ───────────────────▶  │  in-memory edit store    │
 └────────────────────────┘                       └──────────────────────────┘
 ```
 
-- Chunks are `16 × 64 × 16` grids of `uint16` material ids (0 = air),
+- Chunks are `16 × 1024 × 16` grids of `uint16` material ids (0 = air),
   transferred base64-encoded and meshed client-side with face culling.
 - Sub-voxels (all sizes below 1000 mm) live in a sparse overlay keyed by
   their integer mm origin and size — `(x_mm, y_mm, z_mm, size_mm) → id` —

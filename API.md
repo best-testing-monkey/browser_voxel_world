@@ -16,7 +16,7 @@ scenes with spawn points and POIs, voxel size chain
 (`[1000, 500, 100, 50, 10]` mm), and the fluid rule table.
 
 ### `GET /api/chunk?scene=S&cx=N&cz=N`
-One 16×64×16 chunk: `voxels` is a base64 little-endian uint16 array of
+One 16×1024×16 chunk: `voxels` is a base64 little-endian uint16 array of
 material ids (0 = air) for the 1000 mm base grid, `subvoxels` is a list of
 `[x_mm, y_mm, z_mm, size_mm, material_id]` smaller voxels.
 
