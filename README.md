@@ -5,8 +5,12 @@ backend** that dictates the contents of every scene. No dependencies to
 install — the backend is pure Python standard library and Three.js is
 vendored into the repo.
 
+With API calls to make it useable for algorythmic art or visualisation of data.
+
 ![stack](https://img.shields.io/badge/frontend-Three.js%20r160-blue)
 ![stack](https://img.shields.io/badge/backend-Python%203%20stdlib-green)
+
+This is a vibe coding experiment: The challenge is to make this without touching code. Security is mostly ignored, except for specified url/IP to limit access. 
 
 ## Run it
 
