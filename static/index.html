@@ -99,6 +99,31 @@
     border: 1px solid rgba(0,0,0,0.5); }
   .muted { color: #8b98a7; }
 
+  #worlds-btn { pointer-events: auto; margin-left: 8px; padding: 3px 9px;
+    font-size: 11px; background: transparent; color: var(--accent);
+    border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; }
+  #world-list { overflow-y: auto; font-size: 13px; margin-bottom: 14px; }
+  .world-row { display: flex; align-items: center; gap: 8px;
+    padding: 7px 4px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .world-row .wtitle { flex: 1; }
+  .world-row .wtype { font-size: 11px; color: #8b98a7; width: 90px; }
+  .world-row button { font-size: 11px; padding: 4px 8px;
+    background: #1c2330; color: #e8eaf0; border: 1px solid
+    var(--panel-border); border-radius: 5px; cursor: pointer; }
+  .world-row button:hover { border-color: var(--accent); }
+  .world-row input.rename-input { background: #0e1219; color: #e8eaf0;
+    border: 1px solid var(--panel-border); border-radius: 5px;
+    padding: 4px 6px; font-size: 12px; width: 140px; }
+  #world-create { display: flex; flex-direction: column; gap: 10px; }
+  #world-create label { display: flex; flex-direction: column; gap: 4px;
+    font-size: 12px; color: #c2ceda; }
+  #world-create input[type="text"], #world-create input[type="number"] {
+    background: #0e1219; color: #e8eaf0; border: 1px solid
+    var(--panel-border); border-radius: 6px; padding: 7px 9px;
+    font-size: 13px; }
+  #world-type-params { display: flex; gap: 10px; flex-wrap: wrap; }
+  #world-type-params label { flex: 1; min-width: 110px; }
+
   #clock { position: fixed; top: 10px; right: 12px; font-size: 13px;
     font-variant-numeric: tabular-nums; }
 
@@ -159,6 +184,11 @@
         <li>Day/night cycle at 4× realtime (set time/speed via
             <code>POST /api/time</code>) · solid matter blocks you —
             press <b>N</b> for no-clip</li>
+        <li><b>M</b> opens the World manager: create/rename/delete worlds
+            (flat plain, Perlin hills, or a single block in a void)</li>
+        <li><b>Shift+L</b> loads a Minecraft <code>.schem</code>/
+            <code>.schematic</code> file, centered on the block you're
+            looking at</li>
       </ul>
       <button id="start-btn">Click to play</button>
     </div>
@@ -181,6 +211,33 @@
     <div id="inv-list"></div>
   </div>
 </div>
+
+<div id="world-modal" class="modal">
+  <div class="modal-card">
+    <h2>Worlds</h2>
+    <div id="world-list"></div>
+    <h2>Create a new world</h2>
+    <div id="world-create">
+      <label>Name
+        <input id="world-title" type="text" placeholder="My World">
+      </label>
+      <label>Type
+        <select id="world-type">
+          <option value="flat">Flat plain</option>
+          <option value="perlin">Perlin noise hills</option>
+          <option value="single_block">Single block in a void</option>
+        </select>
+      </label>
+      <div id="world-type-params"></div>
+      <button id="world-create-btn" class="btn">Create World</button>
+    </div>
+  </div>
+</div>
+
+<datalist id="material-name-list"></datalist>
+
+<input id="schem-file-input" type="file" accept=".schem,.schematic"
+       style="display:none">
 
 <script type="module" src="/js/main.js"></script>
 </body>

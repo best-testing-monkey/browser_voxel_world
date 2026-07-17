@@ -19,8 +19,12 @@ Sources of names, in order:
 
 import colorsys
 import hashlib
+import re
+from pathlib import Path
 
 MINIMUM_MATERIALS = 1024
+OBJECTS_DIR = Path(__file__).parent / "objects"
+OBJECT_UNIT_MM = 10  # 1 local unit in an objects/*.txt file = 10 mm
 
 # ---------------------------------------------------------------------------
 # Explicit colors for well-known materials (name -> hex). Anything not listed
@@ -136,6 +140,40 @@ KNOWN_COLORS = {
     "Gold": "#ffd700",
     "Silver": "#c0c0c0",
     "Platinum": "#e5e4e2",
+
+    # Missing-materials pass: deepslate ore variants, deepslate/tuff
+    # finishes, copper oxidation stages, mangrove roots.
+    "Deepslate Coal Ore": "#333336",
+    "Deepslate Iron Ore": "#8f8478",
+    "Deepslate Copper Ore": "#7c6b58",
+    "Deepslate Gold Ore": "#a89550",
+    "Deepslate Redstone Ore": "#7a2020",
+    "Deepslate Emerald Ore": "#2f6b48",
+    "Deepslate Lapis Lazuli Ore": "#31447a",
+    "Deepslate Diamond Ore": "#4bb0ab",
+    "Chiseled Deepslate": "#3d3d40",
+    "Cracked Deepslate Bricks": "#3a3a3d",
+    "Cracked Deepslate Tiles": "#38383b",
+    "Tuff Bricks": "#65665f",
+    "Polished Tuff": "#6f7069",
+    "Chiseled Tuff": "#6a6b64",
+    "Cracked Tuff Bricks": "#5f605a",
+    "Waxed Copper Block": "#c06c50",
+    "Waxed Exposed Copper": "#af7a5e",
+    "Waxed Weathered Copper": "#6f9377",
+    "Waxed Oxidized Copper": "#4f9d80",
+    "Exposed Cut Copper": "#ab7b60",
+    "Weathered Cut Copper": "#6c9276",
+    "Oxidized Cut Copper": "#4c9c7e",
+    "Waxed Cut Copper": "#bd6f52",
+    "Copper Bulb": "#c17552",
+    "Exposed Copper Bulb": "#a97e63",
+    "Weathered Copper Bulb": "#6e9074",
+    "Oxidized Copper Bulb": "#4d9a7c",
+    "Copper Grate": "#b96f52",
+    "Exposed Copper Grate": "#a67c62",
+    "Mangrove Roots": "#4c3524",
+    "Muddy Mangrove Roots": "#5c4632",
 }
 
 DYE_COLORS = {
@@ -196,6 +234,18 @@ MINECRAFT_BASE = [
     "Suspicious Gravel", "Decorated Pot", "Piston", "Sticky Piston",
     "Observer", "Dispenser", "Dropper", "Hopper", "Redstone Lamp",
     "Note Block", "Jukebox", "Monster Spawner", "Amethyst Cluster",
+    "Deepslate Coal Ore", "Deepslate Iron Ore", "Deepslate Copper Ore",
+    "Deepslate Gold Ore", "Deepslate Redstone Ore", "Deepslate Emerald Ore",
+    "Deepslate Lapis Lazuli Ore", "Deepslate Diamond Ore",
+    "Chiseled Deepslate", "Cracked Deepslate Bricks",
+    "Cracked Deepslate Tiles", "Tuff Bricks", "Polished Tuff",
+    "Chiseled Tuff", "Cracked Tuff Bricks", "Waxed Copper Block",
+    "Waxed Exposed Copper", "Waxed Weathered Copper",
+    "Waxed Oxidized Copper", "Exposed Cut Copper", "Weathered Cut Copper",
+    "Oxidized Cut Copper", "Waxed Cut Copper", "Copper Bulb",
+    "Exposed Copper Bulb", "Weathered Copper Bulb", "Oxidized Copper Bulb",
+    "Copper Grate", "Exposed Copper Grate", "Mangrove Roots",
+    "Muddy Mangrove Roots",
 ]
 
 MINECRAFT_DYED_FAMILIES = [
@@ -437,6 +487,81 @@ EMISSIVE_LEVELS = {
 _TRANSLUCENT_HINTS = ("Glass",)
 _TRANSLUCENT_EXACT = {"Water", "Ice", "Packed Ice", "Blue Ice"}
 
+# ---------------------------------------------------------------------------
+# Composite "object" materials: fixed voxel shapes (stairs, fences, panes,
+# poles, ...) built from many small sub-voxels rather than a single solid
+# color. Each is defined in objects/{slug}.txt: lines of
+# "X Y Z RRGGBB[AA]" (comments '#', blank lines skipped; X/Y/Z are integers
+# in OBJECT_UNIT_MM units; alpha 00 means the cell is skipped/not placed).
+# If a listed object's file is missing, it still gets a catalog entry
+# (marked objectMissing) so the gap is visible/actionable rather than the
+# material silently not existing; a startup warning is printed too.
+# ---------------------------------------------------------------------------
+OBJECT_MATERIAL_NAMES = [
+    "Oak Stairs", "Stone Slab", "Oak Fence", "Iron Bars", "Glass Pane",
+    "Oak Door", "Iron Trapdoor", "Stone Pressure Plate", "Stone Button",
+    "Torch", "Lantern", "Chain", "Ladder", "Pole",
+]
+
+# Object-name hints propagated onto an object's resolved swatch materials
+# (regular per-material hint matching doesn't apply to swatches, since
+# their names are just "Object Swatch #rrggbb").
+OBJECT_EMISSIVE_HINTS = {"Torch": 12, "Lantern": 14}
+OBJECT_TRANSLUCENT_HINTS = ("Glass", "Pane")
+OBJECT_WOOD_PREFIXES = ("Oak", "Spruce", "Birch", "Jungle", "Acacia",
+                        "Dark Oak", "Mangrove", "Cherry", "Bamboo",
+                        "Crimson", "Warped")
+
+
+def _object_slug(name):
+    return re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+
+
+def _parse_object_file(path):
+    cells = []
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 4:
+            print(f"warning: {path.name}:{lineno}: expected "
+                  f"'X Y Z RRGGBB[AA]', got {raw!r}")
+            continue
+        try:
+            x, y, z = int(parts[0]), int(parts[1]), int(parts[2])
+            hexcolor = parts[3]
+            if len(hexcolor) == 6:
+                r, g, b, a = (int(hexcolor[0:2], 16), int(hexcolor[2:4], 16),
+                             int(hexcolor[4:6], 16), 255)
+            elif len(hexcolor) == 8:
+                r, g, b, a = (int(hexcolor[0:2], 16), int(hexcolor[2:4], 16),
+                             int(hexcolor[4:6], 16), int(hexcolor[6:8], 16))
+            else:
+                raise ValueError("color must be 6 or 8 hex chars")
+        except ValueError as err:
+            print(f"warning: {path.name}:{lineno}: {err} ({raw!r})")
+            continue
+        if a == 0:
+            continue  # fully transparent: not placed
+        cells.append((x, y, z, r, g, b))
+    return cells
+
+
+def load_objects():
+    """Load objects/*.txt shape definitions for OBJECT_MATERIAL_NAMES.
+    Returns {name: {"cells": [(x,y,z,r,g,b), ...], "found": bool}}."""
+    objects = {}
+    for name in OBJECT_MATERIAL_NAMES:
+        path = OBJECTS_DIR / f"{_object_slug(name)}.txt"
+        if path.is_file():
+            objects[name] = {"cells": _parse_object_file(path), "found": True}
+        else:
+            print(f"warning: missing object definition for {name!r} "
+                  f"(expected {path})")
+            objects[name] = {"cells": [], "found": False}
+    return objects
+
 
 def build_materials():
     materials = []
@@ -444,7 +569,7 @@ def build_materials():
 
     def add(name, category, color=None, action=None):
         if name in seen:
-            return
+            return None
         seen.add(name)
         if color is None:
             color = KNOWN_COLORS.get(name) or _derive_color(name, category)
@@ -457,6 +582,7 @@ def build_materials():
         if action:
             entry["action"] = action
         materials.append(entry)
+        return entry
 
     for name in MINECRAFT_BASE:
         add(name, "Minecraft")
@@ -502,6 +628,51 @@ def build_materials():
 
     for name, color, action in INTERACTIVE_MATERIALS:
         add(name, "Interactive", color, action)
+
+    # Composite objects: mint/reuse a swatch material per distinct cell
+    # color, then one outward-facing catalog entry per object shape.
+    color_to_id = {}
+    for m in materials:
+        color_to_id.setdefault(m["color"], m["id"])
+
+    object_defs = load_objects()
+    for name in OBJECT_MATERIAL_NAMES:
+        info = object_defs[name]
+        resolved_cells = []
+        for x, y, z, r, g, b in info["cells"]:
+            hexcolor = "#%02x%02x%02x" % (r, g, b)
+            mat_id = color_to_id.get(hexcolor)
+            if mat_id is None:
+                swatch = add(f"Object Swatch {hexcolor}", "Object Swatch",
+                             hexcolor)
+                mat_id = swatch["id"]
+                color_to_id[hexcolor] = mat_id
+            resolved_cells.append([x, y, z, mat_id])
+
+        rep_color = ("#%02x%02x%02x" % info["cells"][0][3:6]
+                     if info["cells"] else "#9a9a9a")
+        entry = add(name, "Object", rep_color)
+        entry["object"] = True
+        entry["cells"] = resolved_cells
+        if not info["found"]:
+            entry["objectMissing"] = True
+
+        emissive_level = next(
+            (lvl for hint, lvl in OBJECT_EMISSIVE_HINTS.items()
+             if hint in name), None)
+        is_translucent = any(h in name for h in OBJECT_TRANSLUCENT_HINTS)
+        is_wood = name.startswith(OBJECT_WOOD_PREFIXES)
+        if emissive_level or is_translucent or is_wood:
+            swatch_ids = {c[3] for c in resolved_cells}
+            for m in materials:
+                if m["id"] in swatch_ids:
+                    if emissive_level:
+                        m["emissive"] = max(m.get("emissive", 0),
+                                            emissive_level)
+                    if is_translucent:
+                        m["translucent"] = True
+                    if is_wood:
+                        m["flammable"] = True
 
     for m in materials:
         if m["category"] == "Wood" or \

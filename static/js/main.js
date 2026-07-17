@@ -2,6 +2,8 @@ import * as THREE from '/vendor/three.module.js';
 import { createScreenManager } from '/js/screens.js';
 import { createFluidSim } from '/js/fluids.js';
 import { createLightEngine } from '/js/lighting.js';
+import { parseSchematic, placeSchematic, rotateAndNormalize, stepsFromNormal }
+  from '/js/schematic.js';
 
 // ---------------------------------------------------------------------------
 // Config & state
@@ -595,6 +597,7 @@ function updateChunks() {
 // ---------------------------------------------------------------------------
 let editQueue = [];
 let editTimer = null;
+const EDIT_BATCH_SIZE = 2000; // server caps a single request at 8192 edits
 
 function pushEdit(edit) {
   editQueue.push(edit);
@@ -603,17 +606,178 @@ function pushEdit(edit) {
       const edits = editQueue;
       editQueue = [];
       editTimer = null;
+      const sceneName = state.scene.name;
       try {
-        await fetch('/api/edits', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ scene: state.scene.name, edits }),
-        });
+        for (let i = 0; i < edits.length; i += EDIT_BATCH_SIZE) {
+          const batch = edits.slice(i, i + EDIT_BATCH_SIZE);
+          await fetch('/api/edits', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scene: sceneName, edits: batch }),
+          });
+        }
       } catch (err) {
         console.error('edit sync failed', err);
       }
     }, 250);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk voxel apply: shared by schematic import and composite object
+// placement (Part 3). Naively calling setVoxel/setSubVoxel per cell would
+// rebuild the chunk mesh (and relight) once per cell — far too slow for
+// thousands of cells. This groups cells by chunk, writes directly into
+// each loaded chunk's buffers, then rebuilds/relights each touched chunk
+// exactly once. Cells whose chunk isn't loaded locally are simply queued
+// for the backend (applyRemoteEdit already tolerates unloaded chunks the
+// same way once they stream in normally).
+//
+// `sizeMm === MM` (1000): cells are {x,y,z,mat} in BLOCK coordinates
+// (base grid), matching setVoxel(). Otherwise cells are {x,y,z,mat} in
+// integer MM coordinates aligned to `sizeMm`, matching setSubVoxel().
+function applyVoxelCells(cells, sizeMm) {
+  const touched = new Set();
+  for (const cell of cells) {
+    if (sizeMm === MM) {
+      if (cell.y < 0 || cell.y >= CY) continue;
+      const cx = Math.floor(cell.x / CX), cz = Math.floor(cell.z / CZ);
+      const chunk = state.chunks.get(chunkKey(cx, cz));
+      if (chunk && chunk.data) {
+        const lx = cell.x - cx * CX, lz = cell.z - cz * CZ;
+        chunk.data[lx + lz * CX + cell.y * CX * CZ] = cell.mat;
+        touched.add(chunkKey(cx, cz));
+        if (lx === 0) touched.add(chunkKey(cx - 1, cz));
+        if (lx === CX - 1) touched.add(chunkKey(cx + 1, cz));
+        if (lz === 0) touched.add(chunkKey(cx, cz - 1));
+        if (lz === CZ - 1) touched.add(chunkKey(cx, cz + 1));
+      }
+      pushEdit({ op: 'set', x: cell.x, y: cell.y, z: cell.z, id: cell.mat });
+      if (fluidSim) fluidSim.disturbBlock(cell.x, cell.y, cell.z);
+    } else {
+      const chunk = chunkAtMm(cell.x, cell.z);
+      if (chunk) {
+        const key = subKey(cell.x, cell.y, cell.z, sizeMm);
+        if (cell.mat === 0) chunk.sub.delete(key);
+        else {
+          chunk.sub.set(key,
+            { x: cell.x, y: cell.y, z: cell.z, s: sizeMm, mat: cell.mat });
+        }
+        touched.add(chunkKey(chunk.cx, chunk.cz));
+      }
+      pushEdit({ op: 'sub', x: cell.x, y: cell.y, z: cell.z, s: sizeMm,
+                id: cell.mat });
+      if (fluidSim) fluidSim.disturbMm(cell.x, cell.y, cell.z, sizeMm);
+    }
+  }
+  for (const key of touched) {
+    const chunk = state.chunks.get(key);
+    if (chunk && chunk.data) rebuildChunk(chunk);
+  }
+  if (lightEngine) {
+    for (const key of touched) {
+      const [cx, cz] = key.split(',').map(Number);
+      lightEngine.markDirty(cx, cz, remeshRelit);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Composite object placement (Part 3): materials with `object: true` place
+// like any other material — at the normal adjacent block-grid cell that
+// placeBlock() already computes, ignoring the current tool size (a fixed
+// shape can't be carved by voxel-size selection) — but decompose into many
+// small OBJECT_UNIT_MM sub-voxels instead of one solid cube. Shares the
+// rotate/apply helpers with schematic import (schematic.js / applyVoxelCells).
+// ---------------------------------------------------------------------------
+const OBJECT_UNIT_MM = 10;
+
+function placeObject(mat, t) {
+  if (mat.objectMissing || !mat.cells || !mat.cells.length) {
+    showToast(`Object definition missing: ${mat.name}`);
+    console.error(`Object definition missing: ${mat.name} ` +
+      `(no objects/*.txt shape file found for this material)`);
+    return;
+  }
+  const eps = 0.5;
+  const px = t.point.x * MM + t.normal.x * eps;
+  const py = t.point.y * MM + t.normal.y * eps;
+  const pz = t.point.z * MM + t.normal.z * eps;
+  const anchorX = Math.floor(px / MM) * MM;
+  const anchorY = Math.floor(py / MM) * MM;
+  const anchorZ = Math.floor(pz / MM) * MM;
+
+  const local = mat.cells.map(([x, y, z, m]) => ({ x, y, z, mat: m }));
+  const steps = stepsFromNormal(t.normal);
+  const { cells } = rotateAndNormalize(local, steps);
+
+  const worldCells = cells.map((c) => ({
+    x: anchorX + c.x * OBJECT_UNIT_MM,
+    y: anchorY + c.y * OBJECT_UNIT_MM,
+    z: anchorZ + c.z * OBJECT_UNIT_MM,
+    mat: c.mat,
+  }));
+  applyVoxelCells(worldCells, OBJECT_UNIT_MM);
+  consumeBlock(mat.id);
+}
+
+// ---------------------------------------------------------------------------
+// Schematic import: Shift+L captures the current target, then loads a
+// Minecraft .schem/.schematic file centered on it (see schematic.js).
+// ---------------------------------------------------------------------------
+let nameToIdMap = null;
+function buildNameToIdMap() {
+  nameToIdMap = new Map();
+  for (const m of state.materials) if (m) nameToIdMap.set(m.name, m.id);
+}
+
+let capturedSchemTarget = null;
+
+function startSchematicLoad() {
+  if (!state.target) {
+    showToast('Look at a block first');
+    return;
+  }
+  capturedSchemTarget = {
+    base: targetBaseCell(state.target),
+    normal: { ...state.target.normal },
+  };
+  document.exitPointerLock();
+  const input = el('schem-file-input');
+  input.value = '';
+  input.click();
+}
+
+async function handleSchemFileChange(e) {
+  const file = e.target.files[0];
+  const target = capturedSchemTarget;
+  capturedSchemTarget = null;
+  if (!file || !target) return;
+  showToast(`Loading ${file.name}…`);
+  try {
+    if (!nameToIdMap) buildNameToIdMap();
+    const buf = await file.arrayBuffer();
+    const parsed = parseSchematic(buf, nameToIdMap);
+    const totalCells = parsed.width * parsed.height * parsed.length;
+    if (totalCells > 64 * 64 * 64) {
+      showToast(`Schematic too large (${parsed.width}×${parsed.height}` +
+        `×${parsed.length}) — max 64³`);
+      return;
+    }
+    const worldCells = placeSchematic(parsed, target.base, target.normal, CY);
+    applyVoxelCells(worldCells, MM);
+    let msg = `Placed ${file.name}: ${worldCells.length} blocks`;
+    if (parsed.unmapped.length) {
+      msg += ` (${parsed.unmapped.length} unknown block type` +
+        `${parsed.unmapped.length === 1 ? '' : 's'} defaulted to Stone)`;
+      console.warn('Unmapped schematic blocks:', parsed.unmapped);
+    }
+    showToast(msg);
+  } catch (err) {
+    console.error('schematic load failed', err);
+    showToast('Could not load schematic: ' + err.message);
+  }
+  renderer.domElement.requestPointerLock();
 }
 
 // ---------------------------------------------------------------------------
@@ -887,9 +1051,14 @@ function placeBlock() {
     showToast(`Touched ${tm.name}`);
     return;
   }
-  const tool = toolSizeMm();
   const matId = state.hotbar[state.activeSlot].matId;
   if (!matId) return;
+  const placeMat = state.materials[matId];
+  if (placeMat && placeMat.object) {
+    placeObject(placeMat, t);
+    return;
+  }
+  const tool = toolSizeMm();
 
   // Point just outside the hit surface, in mm.
   const eps = 0.5;
@@ -1067,7 +1236,21 @@ async function pollUpdates() {
   try {
     const res = await fetch(
       `/api/updates?scene=${sceneName}&since=${state.rev}`);
-    if (!res.ok) return;
+    if (!res.ok) {
+      // The active world may have been deleted (by this client's own delete
+      // action, another client, or a direct API call) — fall back to the
+      // default scene rather than leaving the client polling/fetching
+      // chunks for a scene that no longer exists.
+      if (res.status === 404 && state.scene && state.scene.name === sceneName) {
+        const fallback = state.config.scenes.find(
+          (m) => m.name === state.config.defaultScene) || state.config.scenes[0];
+        if (fallback && fallback.name !== sceneName) {
+          showToast('Current world was deleted — switched to default');
+          activateScene(fallback);
+        }
+      }
+      return;
+    }
     const p = await res.json();
     if (!state.scene || state.scene.name !== sceneName) return;
     state.rev = p.rev;
@@ -1088,6 +1271,7 @@ const targetInfoEl = el('target-info');
 const sizeInfoEl = el('size-info');
 const matModal = el('mat-modal');
 const invModal = el('inv-modal');
+const worldModal = el('world-modal');
 
 let toastTimer = null;
 function showToast(msg) {
@@ -1142,6 +1326,164 @@ function renderSceneInfo() {
     if (meta) activateScene(meta);
   });
   sceneInfoEl.appendChild(select);
+  const worldsBtn = document.createElement('button');
+  worldsBtn.id = 'worlds-btn';
+  worldsBtn.textContent = 'Worlds (M)';
+  worldsBtn.addEventListener('click', openWorldModal);
+  sceneInfoEl.appendChild(worldsBtn);
+}
+
+// ---------------------------------------------------------------------------
+// World management: create/rename/delete worlds backed by /api/worlds.
+// ---------------------------------------------------------------------------
+async function refreshConfigScenes() {
+  try {
+    const res = await fetch('/api/config');
+    const cfg = await res.json();
+    state.config.scenes = cfg.scenes;
+    state.config.defaultScene = cfg.defaultScene;
+  } catch (err) {
+    console.error('failed to refresh scene list', err);
+  }
+  renderSceneInfo();
+}
+
+function worldTypeParamsHtml(type) {
+  if (type === 'flat') {
+    return `<label>Material
+        <input class="w-material" type="text" list="material-name-list"
+               placeholder="Grass Block"></label>
+      <label>Height (blocks)
+        <input class="w-height" type="number" min="1" max="62" value="4">
+      </label>`;
+  }
+  if (type === 'perlin') {
+    return `<label>Material
+        <input class="w-material" type="text" list="material-name-list"
+               placeholder="Granite"></label>
+      <label>Seed <input class="w-seed" type="number" value="0"></label>
+      <label>Amplitude <input class="w-amplitude" type="number" value="14">
+      </label>`;
+  }
+  return `<label>Material
+      <input class="w-material" type="text" list="material-name-list"
+             placeholder="Stone"></label>`;
+}
+
+function renderWorldTypeParams() {
+  el('world-type-params').innerHTML =
+    worldTypeParamsHtml(el('world-type').value);
+}
+
+async function renderWorldList() {
+  let worlds = [];
+  try {
+    worlds = (await (await fetch('/api/worlds')).json()).worlds;
+  } catch (err) {
+    console.error('failed to load worlds', err);
+  }
+  const list = el('world-list');
+  list.innerHTML = '';
+  for (const w of worlds) {
+    const row = document.createElement('div');
+    row.className = 'world-row';
+    const typeLabel = w.type
+      ? { flat: 'Flat plain', perlin: 'Perlin hills',
+          single_block: 'Single block' }[w.type] || w.type
+      : 'Built-in';
+    row.innerHTML = `<span class="wtitle">${w.title}</span>` +
+      `<span class="wtype">${typeLabel}</span>`;
+    if (w.builtin) {
+      row.innerHTML += '<span class="muted">(built-in)</span>';
+    } else {
+      const renameBtn = document.createElement('button');
+      renameBtn.textContent = 'Rename';
+      renameBtn.addEventListener('click', async () => {
+        const title = prompt('New name:', w.title);
+        if (!title || !title.trim()) return;
+        const res = await fetch('/api/worlds', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'rename', id: w.id, title }),
+        });
+        if (!res.ok) {
+          showToast((await res.json()).error || 'Rename failed');
+          return;
+        }
+        await renderWorldList();
+        await refreshConfigScenes();
+      });
+      const deleteBtn = document.createElement('button');
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.addEventListener('click', async () => {
+        if (!confirm(`Delete world "${w.title}"? This cannot be undone.`)) {
+          return;
+        }
+        const wasActive = state.scene && state.scene.name === w.id;
+        const res = await fetch('/api/worlds', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'delete', id: w.id }),
+        });
+        if (!res.ok) {
+          showToast((await res.json()).error || 'Delete failed');
+          return;
+        }
+        await renderWorldList();
+        await refreshConfigScenes();
+        if (wasActive) {
+          const fallback = state.config.scenes.find(
+            (m) => m.name === state.config.defaultScene) ||
+            state.config.scenes[0];
+          if (fallback) {
+            showToast('Current world was deleted — switched to default');
+            activateScene(fallback);
+          }
+        }
+      });
+      row.appendChild(renameBtn);
+      row.appendChild(deleteBtn);
+    }
+    list.appendChild(row);
+  }
+}
+
+async function createWorld() {
+  const title = el('world-title').value.trim();
+  if (!title) { showToast('Enter a world name'); return; }
+  const type = el('world-type').value;
+  const params = {};
+  const materialInput = document.querySelector('#world-type-params .w-material');
+  if (materialInput) params.material = materialInput.value.trim();
+  const heightInput = document.querySelector('#world-type-params .w-height');
+  if (heightInput) params.height = parseInt(heightInput.value, 10);
+  const seedInput = document.querySelector('#world-type-params .w-seed');
+  if (seedInput) params.seed = parseInt(seedInput.value, 10);
+  const ampInput = document.querySelector('#world-type-params .w-amplitude');
+  if (ampInput) params.amplitude = parseFloat(ampInput.value);
+
+  const res = await fetch('/api/worlds', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'create', title, type, params }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    showToast(data.error || 'Could not create world');
+    return;
+  }
+  el('world-title').value = '';
+  await renderWorldList();
+  await refreshConfigScenes();
+  const meta = state.config.scenes.find((m) => m.name === data.world.id);
+  closeModals();
+  if (meta) activateScene(meta);
+  renderer.domElement.requestPointerLock();
+}
+
+function openWorldModal() {
+  closeModals();
+  document.exitPointerLock();
+  renderWorldTypeParams();
+  renderWorldList();
+  worldModal.classList.add('visible');
 }
 
 function renderTargetInfo() {
@@ -1208,12 +1550,14 @@ function renderMaterialBrowser(filter = '') {
 
 function anyModalOpen() {
   return matModal.classList.contains('visible') ||
-         invModal.classList.contains('visible');
+         invModal.classList.contains('visible') ||
+         worldModal.classList.contains('visible');
 }
 
 function closeModals() {
   matModal.classList.remove('visible');
   invModal.classList.remove('visible');
+  worldModal.classList.remove('visible');
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,6 +1579,14 @@ document.addEventListener('keydown', (e) => {
     document.exitPointerLock();
     renderInventory();
     invModal.classList.add('visible');
+    return;
+  }
+  if (e.code === 'KeyM' && !anyModalOpen()) {
+    openWorldModal();
+    return;
+  }
+  if (e.shiftKey && e.code === 'KeyL' && !anyModalOpen()) {
+    startSchematicLoad();
     return;
   }
   if (e.code === 'Escape' && anyModalOpen()) {
@@ -1310,6 +1662,12 @@ matModal.addEventListener('mousedown', (e) => {
 invModal.addEventListener('mousedown', (e) => {
   if (e.target === invModal) closeModals();
 });
+worldModal.addEventListener('mousedown', (e) => {
+  if (e.target === worldModal) closeModals();
+});
+el('world-type').addEventListener('change', renderWorldTypeParams);
+el('world-create-btn').addEventListener('click', createWorld);
+el('schem-file-input').addEventListener('change', handleSchemFileChange);
 
 // ---------------------------------------------------------------------------
 // Movement & main loop
@@ -1534,6 +1892,14 @@ async function boot() {
   state.materials = [];
   for (const m of state.config.materials) state.materials[m.id] = m;
 
+  const materialList = el('material-name-list');
+  for (const m of state.materials) {
+    if (!m) continue;
+    const opt = document.createElement('option');
+    opt.value = m.name;
+    materialList.appendChild(opt);
+  }
+
   screenMgr = createScreenManager({
     THREE, scene3,
     getSceneName: () => (state.scene ? state.scene.name : ''),
@@ -1593,4 +1959,5 @@ window.__voxel = {
   getScreens: () => screenMgr, getFluids: () => fluidSim, pollUpdates,
   lampLights, boxCollides, apparentHours, syncTime, timeState,
   lightAt: (x, y, z) => (lightEngine ? lightEngine.lightAt(x, y, z) : null),
+  applyVoxelCells, rotateAndNormalize, stepsFromNormal,
 };
