@@ -20,6 +20,15 @@ export function createLightEngine({ state, dims }) {
   const dirty = new Set();
   let timer = null;
 
+  // Highest occupied cell seen anywhere so far (across every chunk that's
+  // been lit at least once) — see lightAt()'s use below. Not per-column:
+  // blocklight can travel horizontally from a tall column's torch into a
+  // shorter neighbouring column's air, landing above *that* column's own
+  // topY, so any single-column bound would risk reading a hardcoded
+  // "open sky, no blocklight" default over a real value the BFS spread
+  // actually wrote.
+  let globalTopY = -1;
+
   const chunkKey = (cx, cz) => `${cx},${cz}`;
 
   // Per-material light behaviour, cached by material id:
@@ -61,10 +70,10 @@ export function createLightEngine({ state, dims }) {
       return { sky: [MAX, MAX, MAX], block: [0, 0, 0] };
     }
     const lx = x - cx * CX, lz = z - cz * CZ;
-    if (chunk.topY && y > chunk.topY[lx + lz * CX]) {
-      // Above the highest occupied cell in this column: open sky, and the
-      // seed pass below never bothered writing it (nothing there needs
-      // lighting — there's no geometry to sample it).
+    if (y > Math.min(CY - 1, globalTopY + MAX)) {
+      // Above anything blocklight could possibly have reached (light
+      // travels at most MAX steps from a level-15 source): open sky, and
+      // the seed/spread pass below never bothered writing this far up.
       return { sky: [MAX, MAX, MAX], block: [0, 0, 0] };
     }
     const v = chunk.light[lx + lz * CX + y * LAYER];
@@ -94,7 +103,13 @@ export function createLightEngine({ state, dims }) {
     for (const c of region) {
       c.light = new Uint32Array(CX * CY * CZ);
       inRegion.set(chunkKey(c.cx, c.cz), c);
+      if (c.topY) {
+        for (let i = 0; i < c.topY.length; i++) {
+          if (c.topY[i] > globalTopY) globalTopY = c.topY[i];
+        }
+      }
     }
+    const lightCeiling = Math.min(CY - 1, globalTopY + MAX);
 
     const idx = (lx, y, lz) => lx + lz * CX + y * LAYER;
     const cellChunk = (x, z) => inRegion.get(
@@ -182,11 +197,11 @@ export function createLightEngine({ state, dims }) {
           const nlx = dx === 1 ? 0 : (dx === -1 ? CX - 1 : i);
           const nlz = dz === 1 ? 0 : (dz === -1 ? CZ - 1 : i);
           const wx = nb.cx * CX + nlx, wz = nb.cz * CZ + nlz;
-          // Mirror the seed pass's bound: nothing above the neighbour's
-          // occupied top ever got a light value written.
-          const nbTop = nb.topY ? nb.topY[nlx + nlz * CX] : CY - 1;
-          if (nbTop < 0) continue;
-          for (let y = 0; y <= Math.min(CY - 1, nbTop + 1); y++) {
+          // Same reasoning as lightAt()'s shortcut: the neighbour's buffer
+          // can hold real values above its own columns' topY too (light
+          // propagated in from elsewhere), so use the shared ceiling
+          // rather than a per-column bound here.
+          for (let y = 0; y <= lightCeiling; y++) {
             const v = nb.light[idx(nlx, y, nlz)];
             const sr = (v >> 20) & 15, sg = (v >> 16) & 15,
                   sb = (v >> 12) & 15;
