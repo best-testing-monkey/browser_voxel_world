@@ -4,6 +4,7 @@ import { createFluidSim } from '/js/fluids.js';
 import { createWorldStore, decodeChunkBinary, chunkKey, subKey }
   from '/js/worldstore.js';
 import { rotateAndNormalize, stepsFromNormal } from '/js/schematic.js';
+import { createSettings, renderSettingsForm } from '/js/settings.js';
 
 // ---------------------------------------------------------------------------
 // Config & state
@@ -15,8 +16,10 @@ import { rotateAndNormalize, stepsFromNormal } from '/js/schematic.js';
 // sub-voxels that fill the remainder — i.e. voxels comprised of smaller
 // voxels.
 // ---------------------------------------------------------------------------
-const LOAD_RADIUS = 3;          // chunks around the player to load
-const UNLOAD_RADIUS = LOAD_RADIUS + 2;
+// Per-player preferences (this browser only): graphics, view, mouse.
+const settings = createSettings();
+let LOAD_RADIUS = settings.get('renderDistance'); // chunks around the player
+let UNLOAD_RADIUS = LOAD_RADIUS + 2;
 const REACH = 8;                // block interaction distance (metres)
 const FLY_SPEED = 12;
 const SPRINT_MULT = 2.6;
@@ -71,6 +74,16 @@ document.getElementById('app').appendChild(renderer.domElement);
 const scene3 = new THREE.Scene();
 scene3.background = new THREE.Color(0x87b5e0);
 scene3.fog = new THREE.Fog(0x87b5e0, 40, 120);
+
+// Render distance: fog reaches its full density just past the loaded
+// chunks, never nearer than the original 120 m.
+function applyRenderDistance(r) {
+  LOAD_RADIUS = r;
+  UNLOAD_RADIUS = r + 2;
+  scene3.fog.far = Math.max(120, (r + 0.5) * 16);
+  scene3.fog.near = scene3.fog.far / 3;
+}
+applyRenderDistance(LOAD_RADIUS);
 
 const camera = new THREE.PerspectiveCamera(
   75, window.innerWidth / window.innerHeight, 0.05, 600);
@@ -1211,6 +1224,7 @@ const sizeInfoEl = el('size-info');
 const matModal = el('mat-modal');
 const invModal = el('inv-modal');
 const worldModal = el('world-modal');
+const settingsModal = el('settings-modal');
 
 let toastTimer = null;
 function showToast(msg) {
@@ -1490,19 +1504,41 @@ function renderMaterialBrowser(filter = '') {
 function anyModalOpen() {
   return matModal.classList.contains('visible') ||
          invModal.classList.contains('visible') ||
-         worldModal.classList.contains('visible');
+         worldModal.classList.contains('visible') ||
+         settingsModal.classList.contains('visible');
 }
+
+function openSettings() {
+  closeModals();
+  document.exitPointerLock();
+  renderSettingsForm(el('settings-form'), settings);
+  settingsModal.classList.add('visible');
+}
+
+settings.onChange((key, value) => {
+  if (key === 'renderDistance') {
+    applyRenderDistance(value);
+    updateChunks();
+  } else if (key === 'fluidShaders' && fluidSim) {
+    fluidSim.setQuality(value);
+  }
+});
 
 function closeModals() {
   matModal.classList.remove('visible');
   invModal.classList.remove('visible');
   worldModal.classList.remove('visible');
+  settingsModal.classList.remove('visible');
 }
 
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
 document.addEventListener('keydown', (e) => {
+  if (e.code === 'Escape' && settingsModal.classList.contains('visible')) {
+    closeModals(); // also works from the start screen
+    return;
+  }
   if (!state.started) return;
 
   if (e.code === 'KeyE' && !anyModalOpen()) {
@@ -1522,6 +1558,10 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.code === 'KeyM' && !anyModalOpen()) {
     openWorldModal();
+    return;
+  }
+  if (e.code === 'KeyO' && !anyModalOpen()) {
+    openSettings();
     return;
   }
   if (e.code === 'KeyL' && state.keys.has('ShiftRight') && !anyModalOpen()) {
@@ -1568,8 +1608,9 @@ document.addEventListener('keyup', (e) => state.keys.delete(e.code));
 
 document.addEventListener('mousemove', (e) => {
   if (!state.pointerLocked) return;
-  state.yaw -= e.movementX * 0.0024;
-  state.pitch -= e.movementY * 0.0024;
+  const k = 0.0024 * settings.get('mouseSensitivity');
+  state.yaw -= e.movementX * k;
+  state.pitch -= e.movementY * k;
   const lim = Math.PI / 2 - 0.01;
   state.pitch = Math.max(-lim, Math.min(lim, state.pitch));
 });
@@ -1603,6 +1644,15 @@ invModal.addEventListener('mousedown', (e) => {
 });
 worldModal.addEventListener('mousedown', (e) => {
   if (e.target === worldModal) closeModals();
+});
+settingsModal.addEventListener('mousedown', (e) => {
+  if (e.target === settingsModal) closeModals();
+});
+el('settings-btn').addEventListener('click', openSettings);
+el('settings-close').addEventListener('click', closeModals);
+el('settings-reset').addEventListener('click', () => {
+  settings.reset();
+  renderSettingsForm(el('settings-form'), settings);
 });
 el('world-type').addEventListener('change', renderWorldTypeParams);
 el('world-create-btn').addEventListener('click', createWorld);
@@ -1857,6 +1907,7 @@ async function boot() {
     materials: workerMaterials,
     toast: showToast,
     getEpoch: () => sceneEpoch,
+    quality: settings.get('fluidShaders'),
     // World changes the fluids cause (obsidian, burning, cooling, floating
     // wood) are ordinary persisted edits, echoed back to every worker.
     applyEffect: (e) => {
@@ -1904,6 +1955,6 @@ window.__voxel = {
   pickBlock, raycastVoxel, storedCount, cycleVoxelSize, decompose,
   toolSizeMm, sendGameEvent, loadedFaucets, ensureNotStuck, findFreeSpot,
   getScreens: () => screenMgr, getFluids: () => fluidSim, pollUpdates,
-  lampLights, boxCollides, apparentHours, syncTime, timeState,
+  lampLights, boxCollides, apparentHours, syncTime, timeState, settings,
   applyVoxelCells, rotateAndNormalize, stepsFromNormal,
 };

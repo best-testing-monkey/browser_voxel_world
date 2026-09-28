@@ -109,6 +109,7 @@ void main() {
   vec3 N = normalize(vNormal);
   if (!gl_FrontFacing) N = -N;           // seen from under the surface
   vec3 V = normalize(cameraPosition - vWorldPos);
+#ifndef FLUID_LOW
   vec2 uv = fl_coords(vWorldPos, N) * 3.0;
   vec2 dir = fl_dir(N, vFlow);
   float speed = length(dir);
@@ -121,6 +122,7 @@ void main() {
                           : normalize(cross(vec3(0.0, 1.0, 0.0), N));
   vec3 B = abs(N.y) > 0.5 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
   N = normalize(N - (T * g.x + B * g.y) * amp);
+#endif
 
   // Fresnel (Schlick, water F0 ~ 0.02).
   float cosT = clamp(dot(N, V), 0.0, 1.0);
@@ -131,7 +133,12 @@ void main() {
   vec3 R = reflect(-V, N);
   vec3 zenith = uSky * 0.65 + vec3(0.02, 0.05, 0.12) * uDay;
   vec3 sky = mix(uSky, zenith, clamp(R.y, 0.0, 1.0));
+#ifdef FLUID_LOW
+  // Flat surface: a broad, soft highlight instead of sharp ripple glints.
+  float sun = pow(max(dot(R, normalize(uSunDir)), 0.0), 40.0) * 0.6 * uDay;
+#else
   float sun = pow(max(dot(R, normalize(uSunDir)), 0.0), 220.0) * 4.0 * uDay;
+#endif
 
   // Depth colouring: shallow water is clear turquoise, deep water dark blue.
   float k = 1.0 - exp(-vDepth * 1.8);
@@ -141,8 +148,12 @@ void main() {
 
   // Foam where it falls or runs fast.
   float churn = clamp(vFlow.z + 0.35 * length(vFlow.xy) - 0.15, 0.0, 1.0);
+#ifdef FLUID_LOW
+  float foam = churn * 0.35;
+#else
   float foam = smoothstep(0.55, 0.85, fl_flowNoise(uv * 1.7, dir, uTime, 1.5, 1.5))
                * churn;
+#endif
 
   vec3 col = mix(body, sky * (0.25 + 0.75 * uDay), F) + vec3(sun);
   col = mix(col, vec3(0.92, 0.96, 1.0) * (0.25 + 0.75 * uDay), foam);
@@ -158,8 +169,14 @@ void main() {
   vec2 uv = fl_coords(vWorldPos, N) * 1.4;
   vec2 dir = fl_dir(N, vFlow);
   // Slow, glowing flow: a molten field with a crust that cracks open.
+#ifdef FLUID_LOW
+  // One value-noise sample drifting along the flow instead of layered fbm.
+  float n = fl_noise(uv * 2.0 - dir * uTime * 0.08) * 0.8 + 0.1;
+  float cracks = 0.5;
+#else
   float n = fl_flowNoise(uv, dir, uTime, 7.0, 0.6);
   float cracks = fl_flowNoise(uv * 3.1 + n * 1.5, dir, uTime, 5.0, 0.9);
+#endif
   float heat = smoothstep(0.30, 0.72, n + 0.12 * sin(uTime * 0.7 + n * 7.0));
   vec3 crust = vec3(0.13, 0.035, 0.02);
   vec3 hot = vec3(1.0, 0.30, 0.04);
@@ -176,10 +193,14 @@ const SAND_FRAG = `${COMMON_FRAG}
 uniform vec3 uColor;
 void main() {
   vec3 N = normalize(vNormal);
+#ifdef FLUID_LOW
+  vec3 col = uColor;
+#else
   vec3 p = vWorldPos * 40.0;
   float grain = fl_noise(vec2(p.x + p.y * 0.61, p.z - p.y * 0.37)) * 0.6 +
                 fl_hash(floor(vec2(p.x * 2.1 + p.y, p.z * 2.1 - p.y))) * 0.4;
   vec3 col = uColor * (0.82 + 0.3 * grain);
+#endif
   float diffuse = max(dot(N, normalize(uSunDir)), 0.0);
   col *= 0.18 + 0.22 * uDay + 0.65 * uDay * diffuse;
   gl_FragColor = vec4(col, 1.0);
@@ -188,7 +209,8 @@ void main() {
 `;
 
 export function createFluidSim({ THREE, scene3, config, dims, materials,
-                                 toast, getEpoch, applyEffect }) {
+                                 toast, getEpoch, applyEffect,
+                                 quality = 'high' }) {
   const sim = new Worker('/js/fluidsim.worker.js', { type: 'module' });
   const surf = new Worker('/js/fluidmesh.worker.js', { type: 'module' });
   const channel = new MessageChannel();
@@ -224,6 +246,16 @@ export function createFluidSim({ THREE, scene3, config, dims, materials,
   };
   // Share the per-frame uniforms (merge() cloned them).
   for (const m of Object.values(mats)) Object.assign(m.uniforms, uniforms);
+
+  // Shader quality (player setting): 'low' compiles the FLUID_LOW variants
+  // (no noise-based ripples, foam or lava texture layers).
+  function setQuality(q) {
+    for (const m of Object.values(mats)) {
+      m.defines = q === 'low' ? { FLUID_LOW: '' } : {};
+      m.needsUpdate = true;
+    }
+  }
+  setQuality(quality);
 
   // ---- surface meshes: "bx,by,bz" -> {water?, lava?, sand?} ----
   const blocks = new Map();
@@ -311,7 +343,7 @@ export function createFluidSim({ THREE, scene3, config, dims, materials,
                             c(max[0]), c(max[1]), c(max[2])] });
   }
 
-  return { worker: sim, surfaceWorker: surf, frame, clear, fill, counts,
-           settledCounts, perf, blocks, materials: mats,
+  return { worker: sim, surfaceWorker: surf, frame, clear, fill, setQuality,
+           counts, settledCounts, perf, blocks, materials: mats,
            budgetPerType: config.maxCellsPerType || 4000 };
 }

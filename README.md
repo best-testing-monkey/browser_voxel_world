@@ -46,6 +46,12 @@ nothing to install and starts instantly.
   goes to your inventory and the remainder is decomposed into the largest
   aligned sub-voxels that fill it (e.g. taking a 10 mm bite out of a
   1000 mm granite block yields 7×500 + 124×100 + 7×50 + 124×10 mm voxels).
+- **Player settings** — press **O** (or the Settings button on the start
+  screen) to change fluid shader quality (*High*: rippling, reflective
+  water and flowing lava; *Low*: flat shading for slower GPUs), render
+  distance (2–8 chunks) and mouse sensitivity. Settings apply immediately
+  and are saved in this browser (`localStorage`), separate from the
+  server's world configuration.
 - **Persistent world**: every edit is POSTed to the backend, which stores
   it in `world_state.db` (SQLite) — changes survive both page reloads *and
   server restarts*. An existing `world_state.json` from an older version is
@@ -233,6 +239,7 @@ nothing to install and starts instantly.
 | `static/js/main.js` | Game client: streaming, controls, editing, unstuck, world manager UI |
 | `static/js/worldstore.js` | Sectioned chunk storage and binary chunk decoding (shared by the page and the workers) |
 | `static/js/mesher.worker.js` | Worker: chunk lighting (`lighting.js`) and meshing |
+| `static/js/settings.js` | Per-player settings (saved in the browser) and the Settings dialog |
 | `static/js/fluids.js` | Fluid rendering and shaders; owns the two fluid workers |
 | `static/js/fluidsim.worker.js` | Worker: level-based fluid simulation |
 | `static/js/fluidmesh.worker.js` | Worker: marching-cubes fluid surfaces (tables in `mc_tables.js`) |
