@@ -66,12 +66,32 @@
     max-height: 86vh; display: flex; flex-direction: column; }
   .modal-card h2 { margin: 0 0 10px; font-size: 18px; color: var(--accent); }
 
-  #start-card { text-align: left; width: min(560px, 92vw); }
+  /* The start card never grows past the window: the controls list scrolls
+     and the scene picker + buttons stay visible, however small the window. */
+  #start-card { text-align: left; width: min(560px, 92vw);
+    max-height: calc(100vh - 24px); overflow: hidden; }
+  #start-ready:not([hidden]) { display: flex; flex-direction: column;
+    min-height: 0; flex: 1; }
+  #start-help { overflow-y: auto; min-height: 0; flex: 1 1 auto; }
+  .start-actions { display: flex; gap: 10px; align-items: center;
+    flex-wrap: wrap; flex: 0 0 auto; }
   #start-card ul { margin: 8px 0; padding-left: 20px; }
   #start-card li { margin: 3px 0; font-size: 14px; }
   #start-btn, .btn { margin-top: 12px; padding: 10px 18px; font-size: 15px;
     background: var(--accent); border: none; border-radius: 8px;
     color: #08121c; font-weight: 700; cursor: pointer; }
+  .btn-secondary { background: transparent; color: var(--accent);
+    border: 1px solid var(--accent); }
+
+  #settings-card { width: min(520px, 92vw); max-height: calc(100vh - 24px); }
+  #settings-form { display: flex; flex-direction: column; gap: 14px;
+    overflow-y: auto; min-height: 0; }
+  .setting-row { display: flex; flex-direction: column; gap: 5px;
+    font-size: 13px; color: #c2ceda; }
+  .setting-range { display: flex; align-items: center; gap: 10px; }
+  .setting-range input { flex: 1; accent-color: var(--accent); }
+  .setting-range output { min-width: 40px; text-align: right;
+    font-variant-numeric: tabular-nums; color: #e8eaf0; }
   select { background: #0e1219; color: #e8eaf0; border: 1px solid
     var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px; }
 
@@ -164,6 +184,7 @@
       <p>Scene:
         <select id="scene-select"></select>
       </p>
+      <div id="start-help">
       <ul>
         <li><b>WASD</b> move · <b>mouse</b> look · <b>Space</b> jump · hold
             <b>F</b> to sprint. You start in <b>walk mode</b> with gravity —
@@ -189,8 +210,14 @@
         <li><b>Right Shift+L</b> loads a Minecraft <code>.schem</code>/
             <code>.schematic</code> file, centered on the block you're
             looking at</li>
+        <li><b>O</b> opens Settings (fluid shader quality, render distance,
+            mouse sensitivity) - saved in this browser</li>
       </ul>
-      <button id="start-btn">Click to play</button>
+      </div>
+      <div class="start-actions">
+        <button id="start-btn">Click to play</button>
+        <button id="settings-btn" class="btn btn-secondary">Settings</button>
+      </div>
     </div>
   </div>
 </div>
@@ -230,6 +257,19 @@
       </label>
       <div id="world-type-params"></div>
       <button id="world-create-btn" class="btn">Create World</button>
+    </div>
+  </div>
+</div>
+
+<div id="settings-modal" class="modal">
+  <div class="modal-card" id="settings-card">
+    <h2>Settings</h2>
+    <p class="muted" style="margin: 0 0 12px; font-size: 12px">
+      Saved in this browser only. Changes apply immediately.</p>
+    <div id="settings-form"></div>
+    <div class="start-actions">
+      <button id="settings-close" class="btn">Done</button>
+      <button id="settings-reset" class="btn btn-secondary">Reset to defaults</button>
     </div>
   </div>
 </div>

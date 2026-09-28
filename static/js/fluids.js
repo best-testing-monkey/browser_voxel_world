@@ -1,395 +1,349 @@
-// Fluid simulation: sand, water and lava as 5 cm (50 mm) fluid voxels that
-// pour out of faucet blocks. The rules (which materials are faucets, what
-// lava+water makes, what burns, what cools) come from the backend's
-// /api/config "fluids" section — the client just executes them.
+// Fluids on the main thread: owns the two fluid workers and draws the
+// fluid surfaces. The rules (which materials are faucets, what lava+water
+// makes, what burns, what cools) come from the backend's /api/config
+// "fluids" section; the workers execute them.
 //
-// Fluid cells live in two tiers and are UNLIMITED in number:
-//   - ACTIVE cells are simulated. `maxCellsPerType` is not a presence cap
-//     but a per-tick movement budget: when more cells are active than the
-//     budget, each tick steps a rotating window of that many cells, so
-//     more moving fluid simply moves slower.
-//   - SETTLED cells reached equilibrium (no movement for `settleAfterTicks`
-//     ticks). They cost nothing per tick: they are not iterated and their
-//     instanced mesh is only re-uploaded when the settled pool actually
-//     changes. They wake back into the active tier when disturbed — a
-//     neighbouring cell vacates, a block nearby is placed or removed, or
-//     a reaction partner arrives.
-// Instanced meshes grow on demand, so rendering follows the fluid volume.
+//   fluidsim.worker.js   simulation: 5 cm cells with fill levels 1..8,
+//                        mass-conserving flow, settling, cross effects
+//   fluidmesh.worker.js  marching-cubes surface per 1 m block per type
+//
+// The two talk directly over a MessageChannel (the simulation streams the
+// changed blocks every tick), so fluids use at most two cores and never
+// block rendering. This module only swaps finished geometry in and feeds
+// the shaders (time, sun, sky colour, day factor) every frame.
 //
 // Fluid cells are ephemeral (not persisted); their *effects* are real world
 // edits: obsidian from lava+water, burned wood, cooled magma.
 
-export function createFluidSim({ THREE, scene3, config, materials, world,
-                                 toast }) {
-  const CELL = (config.cellMm || 50) / 1000;   // metres
-  const PER_BLOCK = Math.round(1 / CELL);      // cells per 1000 mm voxel
-  const BUDGET = config.maxCellsPerType || 4000; // cells stepped per tick/type
-  const SETTLE_TICKS = config.settleAfterTicks || 8;
-  const EMIT_EVERY = config.emitEveryTicks || 2;
-  const BURN_CHANCE = config.burnChance || 0.15;
-  const OBSIDIAN = config.lavaWaterContact;
-  const COOLS_TO = new Map(
-    Object.entries(config.coolsTo || {}).map(([k, v]) => [+k, +v]));
-  const FAUCETS = new Map(
-    Object.entries(config.faucets || {}).map(([k, v]) => [+k, v]));
-
-  const cells = new Map();     // active:  "x,y,z" -> {x,y,z,type,rest,born}
-  const settled = new Map();   // static:  "x,y,z" -> {x,y,z,type}
-  const counts = { sand: 0, water: 0, lava: 0 };         // active only
-  const settledCounts = { sand: 0, water: 0, lava: 0 };
-  let settledDirty = false;
-  let tickNo = 0;
-  let lastToast = 0;
-
-  const key = (x, y, z) => `${x},${y},${z}`;
-
-  function effectToast(msg) {
-    const now = performance.now();
-    if (now - lastToast > 1500) { lastToast = now; toast(msg); }
+const NOISE_GLSL = `
+float fl_hash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+float fl_noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(fl_hash(i), fl_hash(i + vec2(1.0, 0.0)), u.x),
+             mix(fl_hash(i + vec2(0.0, 1.0)), fl_hash(i + vec2(1.0, 1.0)), u.x),
+             u.y);
+}
+float fl_fbm(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) {
+    s += a * fl_noise(p);
+    p = p * 2.03 + vec2(1.7, 9.2);
+    a *= 0.5;
   }
+  return s;
+}
+vec2 fl_grad(vec2 p) {
+  const float e = 0.06;
+  return vec2(fl_fbm(p + vec2(e, 0.0)) - fl_fbm(p - vec2(e, 0.0)),
+              fl_fbm(p + vec2(0.0, e)) - fl_fbm(p - vec2(0.0, e))) / (2.0 * e);
+}
+// Surface parameterisation: horizontal-ish faces use world xz; steep faces
+// (waterfalls, pool walls) use (x + z, y).
+vec2 fl_coords(vec3 wp, vec3 n) {
+  return abs(n.y) > 0.5 ? wp.xz : vec2(wp.x + wp.z, wp.y);
+}
+// Flow direction in those coordinates: horizontal flow on top faces,
+// streaming downward on steep faces.
+vec2 fl_dir(vec3 n, vec3 flow) {
+  return abs(n.y) > 0.5 ? flow.xy : vec2(0.0, -(0.6 + flow.z));
+}
+// Two-phase flow-map blend: two noise layers scroll along the flow and
+// reset half a cycle apart, cross-faded so the reset is never visible.
+vec2 fl_flowGrad(vec2 uv, vec2 dir, float time, float cycle, float dist) {
+  float ph0 = fract(time / cycle);
+  float ph1 = fract(time / cycle + 0.5);
+  float w0 = 1.0 - abs(1.0 - 2.0 * ph0);
+  vec2 g0 = fl_grad(uv - dir * ph0 * dist);
+  vec2 g1 = fl_grad(uv - dir * ph1 * dist + vec2(0.37, 0.71));
+  return g0 * w0 + g1 * (1.0 - w0);
+}
+float fl_flowNoise(vec2 uv, vec2 dir, float time, float cycle, float dist) {
+  float ph0 = fract(time / cycle);
+  float ph1 = fract(time / cycle + 0.5);
+  float w0 = 1.0 - abs(1.0 - 2.0 * ph0);
+  return fl_fbm(uv - dir * ph0 * dist) * w0 +
+         fl_fbm(uv - dir * ph1 * dist + vec2(0.37, 0.71)) * (1.0 - w0);
+}
+`;
 
-  // ---- rendering ----
-  // One InstancedMesh per type for active cells (updated every tick) and a
-  // second one for settled cells (updated only when they change). Meshes
-  // grow on demand — fluid presence is unbounded.
-  const dummy = new THREE.Object3D();
-  const activeMeshes = {};
-  const settledMeshes = {};
+const VERTEX = `
+attribute float aDepth;
+attribute vec3 aFlow;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying float vDepth;
+varying vec3 vFlow;
+#include <fog_pars_vertex>
+void main() {
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWorldPos = wp.xyz;
+  vNormal = normalize(mat3(modelMatrix) * normal);
+  vDepth = aDepth;
+  vFlow = aFlow;
+  vec4 mvPosition = viewMatrix * wp;
+  gl_Position = projectionMatrix * mvPosition;
+  #include <fog_vertex>
+}
+`;
 
-  function makeMesh(type, color, capacity, geo = null, mat = null) {
-    geo = geo ||
-      new THREE.BoxGeometry(CELL * 0.96, CELL * 0.96, CELL * 0.96);
-    if (!mat) {
-      mat = new THREE.MeshLambertMaterial({ color: new THREE.Color(color) });
-      if (type === 'water') {
-        mat.transparent = true;
-        mat.opacity = 0.6;
-      }
-      if (type === 'lava') {
-        mat.emissive = new THREE.Color(color);
-        mat.emissiveIntensity = 0.7;
-      }
+const COMMON_FRAG = `
+uniform float uTime;
+uniform vec3 uSunDir;
+uniform vec3 uSky;
+uniform float uDay;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying float vDepth;
+varying vec3 vFlow;
+#include <fog_pars_fragment>
+${NOISE_GLSL}
+`;
+
+const WATER_FRAG = `${COMMON_FRAG}
+void main() {
+  vec3 N = normalize(vNormal);
+  if (!gl_FrontFacing) N = -N;           // seen from under the surface
+  vec3 V = normalize(cameraPosition - vWorldPos);
+#ifndef FLUID_LOW
+  vec2 uv = fl_coords(vWorldPos, N) * 3.0;
+  vec2 dir = fl_dir(N, vFlow);
+  float speed = length(dir);
+
+  // Wavy normals: still water ripples gently, flowing water more.
+  vec2 drift = vec2(uTime * 0.05, uTime * 0.037);
+  vec2 g = fl_flowGrad(uv + drift, dir, uTime, 2.0, 1.2);
+  float amp = 0.10 + 0.20 * min(speed, 1.5);
+  vec3 T = abs(N.y) > 0.5 ? vec3(1.0, 0.0, 0.0)
+                          : normalize(cross(vec3(0.0, 1.0, 0.0), N));
+  vec3 B = abs(N.y) > 0.5 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+  N = normalize(N - (T * g.x + B * g.y) * amp);
+#endif
+
+  // Fresnel (Schlick, water F0 ~ 0.02).
+  float cosT = clamp(dot(N, V), 0.0, 1.0);
+  float F = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
+
+  // Reflection of the sky: horizon colour to a deeper zenith, plus a sun
+  // glint.
+  vec3 R = reflect(-V, N);
+  vec3 zenith = uSky * 0.65 + vec3(0.02, 0.05, 0.12) * uDay;
+  vec3 sky = mix(uSky, zenith, clamp(R.y, 0.0, 1.0));
+#ifdef FLUID_LOW
+  // Flat surface: a broad, soft highlight instead of sharp ripple glints.
+  float sun = pow(max(dot(R, normalize(uSunDir)), 0.0), 40.0) * 0.6 * uDay;
+#else
+  float sun = pow(max(dot(R, normalize(uSunDir)), 0.0), 220.0) * 4.0 * uDay;
+#endif
+
+  // Depth colouring: shallow water is clear turquoise, deep water dark blue.
+  float k = 1.0 - exp(-vDepth * 1.8);
+  vec3 body = mix(vec3(0.20, 0.58, 0.64), vec3(0.02, 0.10, 0.24), k);
+  float diffuse = 0.55 + 0.45 * max(dot(N, normalize(uSunDir)), 0.0);
+  body *= 0.10 + 0.90 * uDay * diffuse;
+
+  // Foam where it falls or runs fast.
+  float churn = clamp(vFlow.z + 0.35 * length(vFlow.xy) - 0.15, 0.0, 1.0);
+#ifdef FLUID_LOW
+  float foam = churn * 0.35;
+#else
+  float foam = smoothstep(0.55, 0.85, fl_flowNoise(uv * 1.7, dir, uTime, 1.5, 1.5))
+               * churn;
+#endif
+
+  vec3 col = mix(body, sky * (0.25 + 0.75 * uDay), F) + vec3(sun);
+  col = mix(col, vec3(0.92, 0.96, 1.0) * (0.25 + 0.75 * uDay), foam);
+  float alpha = clamp(mix(0.42, 0.9, k) + F * 0.5 + foam, 0.0, 1.0);
+  gl_FragColor = vec4(col, alpha);
+  #include <fog_fragment>
+}
+`;
+
+const LAVA_FRAG = `${COMMON_FRAG}
+void main() {
+  vec3 N = normalize(vNormal);
+  vec2 uv = fl_coords(vWorldPos, N) * 1.4;
+  vec2 dir = fl_dir(N, vFlow);
+  // Slow, glowing flow: a molten field with a crust that cracks open.
+#ifdef FLUID_LOW
+  // One value-noise sample drifting along the flow instead of layered fbm.
+  float n = fl_noise(uv * 2.0 - dir * uTime * 0.08) * 0.8 + 0.1;
+  float cracks = 0.5;
+#else
+  float n = fl_flowNoise(uv, dir, uTime, 7.0, 0.6);
+  float cracks = fl_flowNoise(uv * 3.1 + n * 1.5, dir, uTime, 5.0, 0.9);
+#endif
+  float heat = smoothstep(0.30, 0.72, n + 0.12 * sin(uTime * 0.7 + n * 7.0));
+  vec3 crust = vec3(0.13, 0.035, 0.02);
+  vec3 hot = vec3(1.0, 0.30, 0.04);
+  vec3 white = vec3(1.0, 0.86, 0.38);
+  vec3 col = mix(crust, hot, heat);
+  col = mix(col, white, smoothstep(0.62, 0.9, heat * (0.6 + cracks)));
+  col *= 0.85 + 0.15 * N.y;
+  gl_FragColor = vec4(col, 1.0);
+  #include <fog_fragment>
+}
+`;
+
+const SAND_FRAG = `${COMMON_FRAG}
+uniform vec3 uColor;
+void main() {
+  vec3 N = normalize(vNormal);
+#ifdef FLUID_LOW
+  vec3 col = uColor;
+#else
+  vec3 p = vWorldPos * 40.0;
+  float grain = fl_noise(vec2(p.x + p.y * 0.61, p.z - p.y * 0.37)) * 0.6 +
+                fl_hash(floor(vec2(p.x * 2.1 + p.y, p.z * 2.1 - p.y))) * 0.4;
+  vec3 col = uColor * (0.82 + 0.3 * grain);
+#endif
+  float diffuse = max(dot(N, normalize(uSunDir)), 0.0);
+  col *= 0.18 + 0.22 * uDay + 0.65 * uDay * diffuse;
+  gl_FragColor = vec4(col, 1.0);
+  #include <fog_fragment>
+}
+`;
+
+export function createFluidSim({ THREE, scene3, config, dims, materials,
+                                 toast, getEpoch, applyEffect,
+                                 quality = 'high' }) {
+  const sim = new Worker('/js/fluidsim.worker.js', { type: 'module' });
+  const surf = new Worker('/js/fluidmesh.worker.js', { type: 'module' });
+  const channel = new MessageChannel();
+  sim.postMessage({ type: 'init', dims, materials, config });
+  sim.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+  surf.postMessage({ type: 'init', cellMm: config.cellMm || 50,
+                     port: channel.port2 }, [channel.port2]);
+
+  const counts = { sand: 0, water: 0, lava: 0 };         // active cells
+  const settledCounts = { sand: 0, water: 0, lava: 0 };  // settled cells
+  const perf = { tickMs: 0 };                             // last sim tick
+
+  // ---- materials ----
+  const uniforms = {
+    uTime: { value: 0 },
+    uSunDir: { value: new THREE.Vector3(0.45, 1, 0.3) },
+    uSky: { value: new THREE.Color(0x87b5e0) },
+    uDay: { value: 1 },
+  };
+  const make = (frag, extra = {}, opts = {}) => new THREE.ShaderMaterial({
+    uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, extra]),
+    vertexShader: VERTEX,
+    fragmentShader: frag,
+    fog: true,
+    ...opts,
+  });
+  const colors = config.colors || {};
+  const mats = {
+    water: make(WATER_FRAG, {}, {
+      transparent: true, depthWrite: false, side: THREE.DoubleSide }),
+    lava: make(LAVA_FRAG),
+    sand: make(SAND_FRAG, { uColor: { value: new THREE.Color(colors.sand || '#d7cd9d') } }),
+  };
+  // Share the per-frame uniforms (merge() cloned them).
+  for (const m of Object.values(mats)) Object.assign(m.uniforms, uniforms);
+
+  // Shader quality (player setting): 'low' compiles the FLUID_LOW variants
+  // (no noise-based ripples, foam or lava texture layers).
+  function setQuality(q) {
+    for (const m of Object.values(mats)) {
+      m.defines = q === 'low' ? { FLUID_LOW: '' } : {};
+      m.needsUpdate = true;
     }
-    const mesh = new THREE.InstancedMesh(geo, mat, capacity);
-    mesh.count = 0;
-    mesh.frustumCulled = false;
-    mesh.layers.enable(1); // the directional sun lives on layer 1
-    scene3.add(mesh);
-    return mesh;
   }
+  setQuality(quality);
 
-  for (const [type, color] of Object.entries(config.colors || {})) {
-    activeMeshes[type] = makeMesh(type, color, BUDGET);
-    settledMeshes[type] = makeMesh(type, color, 8192);
-  }
+  // ---- surface meshes: "bx,by,bz" -> {water?, lava?, sand?} ----
+  const blocks = new Map();
 
-  function ensureCapacity(store, type, needed) {
-    const mesh = store[type];
-    if (!mesh || needed <= mesh.instanceMatrix.count) return;
-    const grown = makeMesh(type, null, Math.ceil(needed * 1.5),
-                           mesh.geometry, mesh.material);
-    scene3.remove(mesh);
-    mesh.dispose(); // frees instance buffers; geometry/material are reused
-    store[type] = grown;
-  }
-
-  function writeInstances(store, source) {
-    const needed = { sand: 0, water: 0, lava: 0 };
-    for (const c of source.values()) needed[c.type]++;
-    for (const type of Object.keys(store)) {
-      ensureCapacity(store, type, needed[type]);
-    }
-    const idx = { sand: 0, water: 0, lava: 0 };
-    for (const c of source.values()) {
-      const mesh = store[c.type];
-      if (!mesh) continue;
-      dummy.position.set(
-        c.x * CELL + CELL / 2, c.y * CELL + CELL / 2, c.z * CELL + CELL / 2);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(idx[c.type]++, dummy.matrix);
-    }
-    for (const [type, mesh] of Object.entries(store)) {
-      mesh.count = idx[type];
-      mesh.instanceMatrix.needsUpdate = true;
-    }
-  }
-
-  function render() {
-    writeInstances(activeMeshes, cells);
-    if (settledDirty) {
-      settledDirty = false;
-      writeInstances(settledMeshes, settled);
-    }
-  }
-
-  // ---- tier transitions ----
-  function wakeAt(k) {
-    const c = settled.get(k);
-    if (!c) return;
-    settled.delete(k);
-    settledCounts[c.type]--;
-    settledDirty = true;
-    c.rest = 0;
-    cells.set(k, c);
-    counts[c.type]++;
-  }
-
-  const NEIGHBORS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
-                     [0, 0, 1], [0, 0, -1]];
-
-  // A position was vacated or the world changed there: settled neighbours
-  // may be able to move again.
-  function wakeAround(x, y, z) {
-    for (const [dx, dy, dz] of NEIGHBORS) {
-      wakeAt(key(x + dx, y + dy, z + dz));
-    }
-  }
-
-  function settle(k, c) {
-    // Never settle next to a reaction partner — stay active so the
-    // cross-effect fires.
-    if (c.type === 'lava' || c.type === 'water') {
-      const other = c.type === 'lava' ? 'water' : 'lava';
-      for (const [dx, dy, dz] of NEIGHBORS) {
-        const nk = key(c.x + dx, c.y + dy, c.z + dz);
-        const n = cells.get(nk) || settled.get(nk);
-        if (n && n.type === other) return;
-      }
-    }
-    cells.delete(k);
-    counts[c.type]--;
-    settled.set(k, c);
-    settledCounts[c.type]++;
-    settledDirty = true;
-  }
-
-  // Public: the world changed inside this cell-space box (inclusive min,
-  // exclusive max) — wake any settled cells in and around it.
-  function disturbCells(x0, y0, z0, x1, y1, z1) {
-    for (let x = x0 - 1; x < x1 + 1; x++) {
-      for (let y = y0 - 1; y < y1 + 1; y++) {
-        for (let z = z0 - 1; z < z1 + 1; z++) {
-          wakeAt(key(x, y, z));
-        }
-      }
-    }
-  }
-
-  function disturbBlock(bx, by, bz) {
-    disturbCells(bx * PER_BLOCK, by * PER_BLOCK, bz * PER_BLOCK,
-                 (bx + 1) * PER_BLOCK, (by + 1) * PER_BLOCK,
-                 (bz + 1) * PER_BLOCK);
-  }
-
-  function disturbMm(xMm, yMm, zMm, sizeMm) {
-    const s = Math.max(1, Math.round(sizeMm / (CELL * 1000)));
-    const cx = Math.floor(xMm / (CELL * 1000));
-    const cy = Math.floor(yMm / (CELL * 1000));
-    const cz = Math.floor(zMm / (CELL * 1000));
-    disturbCells(cx, cy, cz, cx + s, cy + s, cz + s);
-  }
-
-  // ---- movement ----
-  function isFree(x, y, z) {
-    if (y < 0) return false;
-    const k = key(x, y, z);
-    return !cells.has(k) && !settled.has(k) && !world.isSolidCell(x, y, z);
-  }
-
-  function spawn(type, x, y, z) {
-    // Fluid presence is unbounded — only movement is budgeted per tick.
-    if (!isFree(x, y, z)) return;
-    cells.set(key(x, y, z), { x, y, z, type, rest: 0 });
-    counts[type]++;
-  }
-
-  function despawn(k, c) {
-    cells.delete(k);
-    counts[c.type]--;
-    wakeAround(c.x, c.y, c.z);
-  }
-
-  function despawnSettled(k, c) {
-    settled.delete(k);
-    settledCounts[c.type]--;
-    settledDirty = true;
-    wakeAround(c.x, c.y, c.z);
-  }
-
-  function moveTo(c, nx, ny, nz) {
-    const ox = c.x, oy = c.y, oz = c.z;
-    cells.delete(key(ox, oy, oz));
-    c.x = nx; c.y = ny; c.z = nz;
-    c.rest = 0;
-    cells.set(key(nx, ny, nz), c);
-    wakeAround(ox, oy, oz);
-  }
-
-  const DIAG = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-
-  function step(c) {
-    if (c.y <= 0) { despawn(key(c.x, c.y, c.z), c); return; }
-    if (isFree(c.x, c.y - 1, c.z)) {
-      // Falling: water and sand drop two cells per tick, lava one.
-      if (c.type !== 'lava' && isFree(c.x, c.y - 2, c.z) && c.y > 1) {
-        moveTo(c, c.x, c.y - 2, c.z);
-      } else {
-        moveTo(c, c.x, c.y - 1, c.z);
-      }
-      return;
-    }
-    const dirs = DIAG.slice().sort(() => Math.random() - 0.5);
-    for (const [dx, dz] of dirs) {
-      if (isFree(c.x + dx, c.y - 1, c.z + dz)) {
-        moveTo(c, c.x + dx, c.y - 1, c.z + dz);
-        return;
-      }
-    }
-    if (c.type !== 'sand') { // sand piles up; water and lava spread
-      const sideChance = c.type === 'water' ? 0.5 : 0.2;
-      if (Math.random() < sideChance) {
-        const [dx, dz] = dirs[0];
-        if (isFree(c.x + dx, c.y, c.z + dz)) {
-          moveTo(c, c.x + dx, c.y, c.z + dz);
-          return;
-        }
-      }
-    }
-    c.rest++;
-  }
-
-  // ---- cross effects ----
-  function fluidAt(k) {
-    return cells.get(k) || settled.get(k) || null;
-  }
-
-  function removeFluid(k, c) {
-    if (cells.has(k)) despawn(k, c);
-    else despawnSettled(k, c);
-  }
-
-  function crossEffects() {
-    let ops = 0;
-    for (const [k, c] of [...cells.entries()]) {
-      if (ops > 40) break;
-      if (!cells.has(k)) continue; // consumed by an earlier effect
-
-      if (c.type === 'lava') {
-        for (const [dx, dy, dz] of NEIGHBORS) {
-          const nk = key(c.x + dx, c.y + dy, c.z + dz);
-          const n = fluidAt(nk);
-          if (n && n.type === 'water') {
-            // Lava + water: the lava cell freezes to (persisted) obsidian
-            despawn(k, c);
-            removeFluid(nk, n);
-            world.setSub(c.x * 50, c.y * 50, c.z * 50, 50, OBSIDIAN);
-            effectToast('Lava + water → Obsidian');
-            ops++;
-            break;
-          }
-          const solid = world.blockAtCell(c.x + dx, c.y + dy, c.z + dz);
-          if (solid && materials[solid.id] &&
-              materials[solid.id].flammable && Math.random() < BURN_CHANCE) {
-            if (solid.kind === 'base') {
-              world.setBase(solid.x, solid.y, solid.z, 0);
-            } else {
-              world.setSub(solid.x, solid.y, solid.z, solid.s, 0);
-            }
-            effectToast(`${materials[solid.id].name} burned in lava`);
-            ops++;
-          }
-        }
-      } else if (c.type === 'water') {
-        for (const [dx, dy, dz] of NEIGHBORS) {
-          const solid = world.blockAtCell(c.x + dx, c.y + dy, c.z + dz);
-          if (!solid) continue;
-          const cooled = COOLS_TO.get(solid.id);
-          if (cooled !== undefined && solid.kind === 'base') {
-            world.setBase(solid.x, solid.y, solid.z, cooled);
-            effectToast(`Water cooled ${materials[solid.id].name}` +
-              ` → ${materials[cooled].name}`);
-            ops++;
-          }
-        }
-        // Wood floats: a small (50 mm) wooden voxel below rises through
-        const below = world.subExactAtCell(c.x, c.y - 1, c.z);
-        if (below && materials[below.mat] && materials[below.mat].flammable &&
-            ops <= 40) {
-          world.setSub(below.x, below.y, below.z, 50, 0);
-          world.setSub(c.x * 50, c.y * 50, c.z * 50, 50, below.mat);
-          moveTo(c, c.x, c.y - 1, c.z);
-          ops++;
-        }
-      }
+  function disposeBlock(entry) {
+    for (const mesh of Object.values(entry)) {
+      scene3.remove(mesh);
+      mesh.geometry.dispose();
     }
   }
 
-  // ---- faucet emission ----
-  function emit() {
-    if (tickNo % EMIT_EVERY) return;
-    for (const f of world.faucets()) {
-      const type = FAUCETS.get(f.id);
-      if (!type) continue;
-      const cx = f.x * PER_BLOCK + (PER_BLOCK >> 1) +
-        (Math.floor(Math.random() * 3) - 1);
-      const cz = f.z * PER_BLOCK + (PER_BLOCK >> 1) +
-        (Math.floor(Math.random() * 3) - 1);
-      spawn(type, cx, f.y * PER_BLOCK - 1, cz);
+  surf.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type !== 'surface' || msg.epoch !== getEpoch()) return;
+    const key = `${msg.bx},${msg.by},${msg.bz}`;
+    const old = blocks.get(key);
+    if (old) disposeBlock(old);
+    const entry = {};
+    for (const [type, g] of Object.entries(msg.meshes)) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(g.positions, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(g.normals, 3));
+      geo.setAttribute('aDepth', new THREE.BufferAttribute(g.depth, 1));
+      geo.setAttribute('aFlow', new THREE.BufferAttribute(g.flow, 3));
+      geo.computeBoundingSphere();
+      const mesh = new THREE.Mesh(geo, mats[type]);
+      mesh.position.set(msg.bx, msg.by, msg.bz);
+      mesh.renderOrder = type === 'water' ? 2 : 0;
+      scene3.add(mesh);
+      entry[type] = mesh;
     }
-  }
+    if (Object.keys(entry).length) blocks.set(key, entry);
+    else blocks.delete(key);
+  };
+  surf.onerror = (e) => console.error('fluid surface worker error', e.message || e);
 
-  const cursor = { sand: 0, water: 0, lava: 0 };
-
-  function tick() {
-    tickNo++;
-    emit();
-    // Movement budget: when more cells of a type are active than BUDGET,
-    // step a rotating window of BUDGET cells so every cell still gets its
-    // turn — more moving fluid just moves proportionally slower.
-    const byType = { sand: [], water: [], lava: [] };
-    for (const c of cells.values()) {
-      if (byType[c.type]) byType[c.type].push(c);
+  sim.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === 'toast') toast(msg.text);
+    if (msg.epoch !== getEpoch()) return;
+    if (msg.type === 'effects') {
+      for (const effect of msg.list) applyEffect(effect);
+    } else if (msg.type === 'stats') {
+      Object.assign(counts, msg.counts);
+      Object.assign(settledCounts, msg.settledCounts);
+      perf.tickMs = msg.tickMs;
     }
-    const toStep = [];
-    for (const [type, list] of Object.entries(byType)) {
-      if (list.length <= BUDGET) {
-        cursor[type] = 0;
-        toStep.push(...list);
-      } else {
-        const start = cursor[type] % list.length;
-        for (let i = 0; i < BUDGET; i++) {
-          toStep.push(list[(start + i) % list.length]);
-        }
-        cursor[type] = (start + BUDGET) % list.length;
+  };
+  sim.onerror = (e) => console.error('fluid simulation worker error', e.message || e);
+
+  let time = 0;
+  function frame(dt, camera, sunDir, skyColor, day) {
+    time += dt;
+    uniforms.uTime.value = time;
+    uniforms.uSunDir.value.copy(sunDir);
+    uniforms.uSky.value.copy(skyColor);
+    uniforms.uDay.value = day;
+    if (scene3.fog) {
+      for (const m of Object.values(mats)) {
+        m.uniforms.fogColor.value.copy(scene3.fog.color);
+        m.uniforms.fogNear.value = scene3.fog.near;
+        m.uniforms.fogFar.value = scene3.fog.far;
       }
     }
-    toStep.sort((a, b) => a.y - b.y);
-    for (const c of toStep) {
-      if (c.type === 'lava' && tickNo % 2) continue; // lava is slower
-      if (c.type === 'sand' && tickNo % 2 === 0 && Math.random() < 0.3) {
-        continue; // sand a touch slower than water
-      }
-      step(c);
-    }
-    crossEffects();
-    // Promote cells that reached equilibrium to the settled tier.
-    for (const [k, c] of [...cells.entries()]) {
-      if (c.rest >= SETTLE_TICKS) settle(k, c);
-    }
-    render();
   }
 
+  // Scene switch: the simulation worker is cleared through the regular
+  // world-worker 'clear' message; drop our meshes and stale surfaces.
   function clear() {
-    cells.clear();
-    settled.clear();
-    for (const type of Object.keys(counts)) {
-      counts[type] = 0;
-      settledCounts[type] = 0;
+    for (const entry of blocks.values()) disposeBlock(entry);
+    blocks.clear();
+    surf.postMessage({ type: 'clear', epoch: getEpoch() });
+    for (const k of Object.keys(counts)) {
+      counts[k] = 0;
+      settledCounts[k] = 0;
     }
-    settledDirty = true;
-    render();
   }
 
-  return { tick, clear, cells, settled, counts, settledCounts, spawn,
-           disturbBlock, disturbMm, budgetPerType: BUDGET };
+  // Fill a box given in metres (world coordinates) with fluid, e.g.
+  // __voxel.getFluids().fill('water', [x0, y0, z0], [x1, y1, z1]).
+  function fill(fluid, min, max) {
+    const c = (v) => Math.round(v * 1000 / (config.cellMm || 50));
+    sim.postMessage({ type: 'fill', fluid,
+                      box: [c(min[0]), c(min[1]), c(min[2]),
+                            c(max[0]), c(max[1]), c(max[2])] });
+  }
+
+  return { worker: sim, surfaceWorker: surf, frame, clear, fill, setQuality,
+           counts, settledCounts, perf, blocks, materials: mats,
+           budgetPerType: config.maxCellsPerType || 4000 };
 }

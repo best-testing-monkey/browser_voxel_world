@@ -17,8 +17,22 @@ scenes with spawn points and POIs, voxel size chain
 
 ### `GET /api/chunk?scene=S&cx=N&cz=N`
 One 16×1024×16 chunk: `voxels` is a base64 little-endian uint16 array of
-material ids (0 = air) for the 1000 mm base grid, `subvoxels` is a list of
+material ids (0 = air) for the 1000 mm base grid, indexed
+`x + z*16 + y*256`; `subvoxels` is a list of
 `[x_mm, y_mm, z_mm, size_mm, material_id]` smaller voxels.
+
+### `GET /api/chunk?scene=S&cx=N&cz=N&format=bin`
+The same chunk in the compact binary format the browser uses (sent with
+`Content-Encoding: gzip` when the client accepts it; typically a few hundred
+bytes instead of ~680 KB of JSON). All values are little endian:
+
+| Part | Layout |
+| --- | --- |
+| header (20 bytes) | `"VXC1"`, int32 `cx`, int32 `cz`, uint16 section count, uint16 total sections (64), uint32 sub-voxel count |
+| each non-empty section | uint16 `sy`, then 16×16×16 uint16 material ids indexed `x + z*16 + y*256` (world y = `sy*16 + y`) |
+| each sub-voxel | int32 `x_mm`, int32 `y_mm`, int32 `z_mm`, uint16 `size_mm`, uint16 material id |
+
+Sections that are entirely air are left out.
 
 ### `POST /api/edits` — place and remove voxels
 ```json
@@ -32,8 +46,9 @@ material ids (0 = air) for the 1000 mm base grid, `subvoxels` is a list of
   `id: 0` removes.
 - `op:"sub"`: a smaller voxel; coordinates and size in integer millimetres,
   aligned to the size (`x % s == 0`), size one of 500/100/50/10.
-- Edits persist to `world_state.json` and are pushed to connected browsers
-  within ~2 s (they poll `GET /api/updates`).
+- Edits persist to `world_state.db` (SQLite, written in batches about once
+  a second) and are pushed to connected browsers within ~2 s (they poll
+  `GET /api/updates`).
 
 ### `GET /api/updates?scene=S&since=REV`
 Everything that changed after revision `REV`: world edits (same op format),
@@ -77,8 +92,10 @@ dimension cap, or an unrecognized file format).
 
 Placement is written directly into the scene's edit store — same effect as
 many `POST /api/edits` calls, including replacing existing voxels with air
-where the schematic has air — and persists to `world_state.json` like any
-other edit.
+where the schematic has air — and persists to `world_state.db` like any
+other edit. Browsers refetch the affected chunks; a player who ends up
+inside the pasted blocks is moved to the nearest free spot (straight up
+first, then sideways).
 
 ## Worlds
 
@@ -205,16 +222,24 @@ is echoed in every `GET /api/updates` response, so browsers resync within
 ## Fluids
 
 Fluid behaviour is configured by the backend (`fluids` in `/api/config`)
-and simulated in the browser as 5 cm cells: faucet material ids, colors,
-what lava+water freezes into, which "hot" materials water cools, and the
-burn chance for flammables. Fluid *effects* (obsidian, burned wood, cooled
-magma) come back through `POST /api/edits` and persist.
+and simulated in the browser (in a Web Worker) as 5 cm cells: faucet
+material ids, colors, what lava+water freezes into, which "hot" materials
+water cools, and the burn chance for flammables. Fluid *effects*
+(obsidian, burned wood, cooled magma) come back through `POST /api/edits`
+and persist.
+
+Water and lava cells carry a fill level of 1–8 eighths and conserve mass:
+a cell pours into the cell below until it is full, then shares one eighth
+at a time with lower neighbours, so pools level out. Lava keeps at least
+two eighths per cell and moves every other tick; sand is always a full
+cell and sinks through liquids.
 
 Fluid presence is unbounded — cells are never despawned to make room.
 `maxCellsPerType` is a per-tick movement budget: when more cells are in
 motion than the budget, a rotating window of that many cells is stepped
 each tick, so heavy flows slow down instead of losing volume. Cells that
-stop moving for `settleAfterTicks` ticks are promoted to a settled tier:
+go `settleAfterTicks` steps (default 2) without any change are promoted to
+a settled tier:
 excluded from simulation and from the movement budget, re-rendered only
 on change, and woken when the world changes around them.
 
