@@ -146,6 +146,25 @@ const SIDES = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 
 const fluidAt = (k) => cells.get(k) || settled.get(k);
 
+// Every cell (either tier) indexed by its 1 m block, so building a block's
+// render grid only visits the cells that exist instead of probing every
+// position in it.
+const blockIndex = new Map();   // key(bx, by, bz) -> Set<cell>
+const blockKeyOf = (x, y, z) => key(blockOf(x), blockOf(y), blockOf(z));
+function indexAdd(c) {
+  const k = blockKeyOf(c.x, c.y, c.z);
+  let set = blockIndex.get(k);
+  if (!set) blockIndex.set(k, set = new Set());
+  set.add(c);
+}
+function indexRemove(c) {
+  const k = blockKeyOf(c.x, c.y, c.z);
+  const set = blockIndex.get(k);
+  if (!set) return;
+  set.delete(c);
+  if (!set.size) blockIndex.delete(k);
+}
+
 function wakeKey(k) {
   const c = settled.get(k);
   if (!c) return;
@@ -184,6 +203,7 @@ function settle(k, c) {
 function removeCell(k, c) {
   if (cells.delete(k)) counts[TYPE_NAMES[c.t]]--;
   else if (settled.delete(k)) settledCounts[TYPE_NAMES[c.t]]--;
+  indexRemove(c);
   markDirty(c.x, c.y, c.z);
   wakeAround(c.x, c.y, c.z);
 }
@@ -191,6 +211,7 @@ function removeCell(k, c) {
 function addCell(t, l, x, y, z, fx = 0, fz = 0) {
   const c = { x, y, z, t, l, rest: 0, fx, fz, fall: 0 };
   cells.set(key(x, y, z), c);
+  indexAdd(c);
   counts[TYPE_NAMES[t]]++;
   markDirty(x, y, z);
   wakeAround(x, y, z);
@@ -200,9 +221,11 @@ function addCell(t, l, x, y, z, fx = 0, fz = 0) {
 function moveTo(c, nx, ny, nz) {
   const ox = c.x, oy = c.y, oz = c.z;
   cells.delete(key(ox, oy, oz));
+  indexRemove(c);
   c.x = nx; c.y = ny; c.z = nz;
   c.rest = 0;
   cells.set(key(nx, ny, nz), c);
+  indexAdd(c);
   markDirty(ox, oy, oz);
   markDirty(nx, ny, nz);
   if (c.fall) {
@@ -260,9 +283,13 @@ function stepSand(c) {
     if (wasSettled) wakeKey(bk);
     cells.delete(k);
     cells.delete(bk);
+    indexRemove(c);
+    indexRemove(below);
     below.y = c.y; c.y -= 1;
     cells.set(key(below.x, below.y, below.z), below);
     cells.set(key(c.x, c.y, c.z), c);
+    indexAdd(c);
+    indexAdd(below);
     below.rest = 0; c.rest = 0;
     markDirty(c.x, c.y, c.z);
     markDirty(below.x, below.y, below.z);
@@ -327,10 +354,28 @@ function stepLiquid(c) {
       }
     }
   } else {
-    // Too thin to spread: a sheet reaching a ledge flows over the edge.
+    // Too thin to spread. Merge into a same-fluid neighbour that has room
+    // (so stray eighths on top of a pool join its surface layer instead of
+    // standing up as bumps), or slide to a spot it can drop down from
+    // (a sheet reaching a ledge flows over the edge).
     for (const [dx, dz] of sides) {
       const nx = c.x + dx, nz = c.z + dz;
-      if (free(nx, c.y, nz) && free(nx, c.y - 1, nz)) {
+      const n = fluidAt(key(nx, c.y, nz));
+      if (n && n.t === c.t && n.l >= c.l && n.l + c.l <= FULL) {
+        n.l += c.l;
+        n.fx = n.fx * 0.5 + dx * 0.5;
+        n.fz = n.fz * 0.5 + dz * 0.5;
+        touched(n);
+        removeCell(key(c.x, c.y, c.z), c);
+        return;
+      }
+    }
+    for (const [dx, dz] of sides) {
+      const nx = c.x + dx, nz = c.z + dz;
+      if (!free(nx, c.y, nz)) continue;
+      const under = fluidAt(key(nx, c.y - 1, nz));
+      if ((!under && !isSolid(nx, c.y - 1, nz)) ||
+          (under && under.t === c.t && under.l < FULL)) {
         moveTo(c, nx, c.y, nz);
         c.fx = dx; c.fz = dz;
         return;
@@ -542,8 +587,13 @@ function tick() {
   sendDirtyBlocks();
   tickMs = performance.now() - t0;
   if (tickNo % 5 === 0) {
+    // Total fill in eighths per fluid: constant unless faucets emit or
+    // fluid falls out of the world / reacts (handy for tests).
+    const mass = { water: 0, lava: 0, sand: 0 };
+    for (const c of cells.values()) mass[TYPE_NAMES[c.t]] += c.l;
+    for (const c of settled.values()) mass[TYPE_NAMES[c.t]] += c.l;
     postMessage({ type: 'stats', epoch, counts: { ...counts },
-                  settledCounts: { ...settledCounts }, tickMs });
+                  settledCounts: { ...settledCounts }, tickMs, mass });
   }
 }
 
@@ -563,14 +613,22 @@ const DEPTH_CAP = 60;
 const TRAIL = 3;
 const TRAIL_LEVEL = 4;
 
+// Trail cells bucketed by 1 m block: blockKey -> [[x, y, z, cell], ...].
 function buildTrails() {
   const trails = new Map();
+  const seen = new Set();
   for (const c of cells.values()) {
     if (!c.fall) continue;
     for (let d = 1; d <= TRAIL; d++) {
-      const k = key(c.x, c.y + d, c.z);
-      if (fluidAt(k) || isSolid(c.x, c.y + d, c.z)) break;
-      if (!trails.has(k)) trails.set(k, c);
+      const y = c.y + d;
+      const k = key(c.x, y, c.z);
+      if (fluidAt(k) || isSolid(c.x, y, c.z)) break;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      const bk = blockKeyOf(c.x, y, c.z);
+      let list = trails.get(bk);
+      if (!list) trails.set(bk, list = []);
+      list.push([c.x, y, c.z, c]);
     }
   }
   return trails;
@@ -579,6 +637,7 @@ function buildTrails() {
 function sendDirtyBlocks() {
   if (!port || !dirtyBlocks.size) return;
   const P = PER_BLOCK + 2;
+  const PP = P * P;
   let keys = [...dirtyBlocks];
   if (keys.length > MAX_BLOCKS_PER_TICK) {
     const fbx = focus.x, fbz = focus.z;
@@ -592,40 +651,45 @@ function sendDirtyBlocks() {
   const blocks = [];
   const transfer = [];
   const trails = buildTrails();
+  const flowByte = (v) => Math.round(Math.max(-1, Math.min(1, v)) * 127);
   for (const bkey of keys) {
     dirtyBlocks.delete(bkey);
     const [bx, by, bz] = bkey.split(',').map(Number);
     const x0 = bx * PER_BLOCK - 1, y0 = by * PER_BLOCK - 1, z0 = bz * PER_BLOCK - 1;
-    const grid = new Uint8Array(P * P * P);
-    const depth = new Uint8Array(P * P * P);
-    const flow = new Int8Array(P * P * P * 3);
+    const grid = new Uint8Array(P * PP);
+    const depth = new Uint8Array(P * PP);
+    const flow = new Int8Array(P * PP * 3);
+
+    // Fluid cells of this block and its 26 neighbours that fall inside the
+    // padded grid.
     let any = false;
-    for (let j = 0; j < P; j++) {
-      for (let k = 0; k < P; k++) {
-        for (let i = 0; i < P; i++) {
-          const x = x0 + i, y = y0 + j, z = z0 + k;
-          const idx = i + k * P + j * P * P;
-          const k0 = key(x, y, z);
-          let c = fluidAt(k0);
-          let level = c ? c.l : 0;
-          if (!c && (c = trails.get(k0))) level = Math.min(c.l, TRAIL_LEVEL);
-          if (c) {
-            grid[idx] = (c.t << 4) | level;
-            flow[idx * 3] = Math.round(Math.max(-1, Math.min(1, c.fx)) * 127);
-            flow[idx * 3 + 1] = Math.round(Math.max(-1, Math.min(1, c.fz)) * 127);
-            flow[idx * 3 + 2] = c.fall ? 127 : 0;
-            if (j === 0) {
-              let d = 1;
-              while (d < DEPTH_CAP && fluidAt(key(x, y - d, z))) d++;
-              depth[idx] = d;
-            } else {
-              depth[idx] = Math.min(DEPTH_CAP, depth[idx - P * P] + 1);
-            }
-            if (j > 0 && j < P - 1 && i > 0 && i < P - 1 && k > 0 && k < P - 1) {
-              any = true;
-            }
-          } else if (isSolid(x, y, z)) {
-            grid[idx] = 0x80;
+    const put = (x, y, z, c, level) => {
+      const i = x - x0, j = y - y0, k = z - z0;
+      if (i < 0 || i >= P || j < 0 || j >= P || k < 0 || k >= P) return;
+      const idx = i + k * P + j * PP;
+      if (grid[idx]) return;
+      grid[idx] = (c.t << 4) | level;
+      flow[idx * 3] = flowByte(c.fx);
+      flow[idx * 3 + 1] = flowByte(c.fz);
+      flow[idx * 3 + 2] = c.fall ? 127 : 0;
+      if (i > 0 && i < P - 1 && j > 0 && j < P - 1 && k > 0 && k < P - 1) any = true;
+    };
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          const nk = key(bx + dx, by + dy, bz + dz);
+          const set = blockIndex.get(nk);
+          if (set) for (const c of set) put(c.x, c.y, c.z, c, c.l);
+        }
+      }
+    }
+    // Render-only trails above falling cells, where nothing else is.
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          const list = trails.get(key(bx + dx, by + dy, bz + dz));
+          if (list) {
+            for (const [x, y, z, c] of list) put(x, y, z, c, Math.min(c.l, TRAIL_LEVEL));
           }
         }
       }
@@ -633,6 +697,68 @@ function sendDirtyBlocks() {
     if (!any) {
       blocks.push({ bx, by, bz, empty: true });
       continue;
+    }
+
+    // Solids, from the 27 surrounding 1 m voxels (the padding reaches one
+    // cell into each neighbour), plus 50 mm sub-voxel occupancy.
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const vx = bx + dx, vy = by + dy, vz = bz + dz;
+          const solid = vy < 0 || !store.chunkAt(vx, vz) ||
+            (vy < store.CY && store.getVoxel(vx, vy, vz));
+          if (!solid) continue;
+          const i0 = Math.max(0, vx * PER_BLOCK - x0), i1 = Math.min(P, (vx + 1) * PER_BLOCK - x0);
+          const j0 = Math.max(0, vy * PER_BLOCK - y0), j1 = Math.min(P, (vy + 1) * PER_BLOCK - y0);
+          const k0 = Math.max(0, vz * PER_BLOCK - z0), k1 = Math.min(P, (vz + 1) * PER_BLOCK - z0);
+          for (let j = j0; j < j1; j++) {
+            for (let k = k0; k < k1; k++) {
+              for (let i = i0; i < i1; i++) {
+                const idx = i + k * P + j * PP;
+                if (!grid[idx]) grid[idx] = 0x80;
+              }
+            }
+          }
+        }
+      }
+    }
+    const subChunks = new Set();
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const chunk = store.chunkAt(bx + dx, bz + dz);
+        if (chunk && chunk.sub.size) subChunks.add(chunk);
+      }
+    }
+    for (const chunk of subChunks) {
+      {
+        const occ = subCells(chunk);
+        for (let j = 0; j < P; j++) {
+          for (let k = 0; k < P; k++) {
+            for (let i = 0; i < P; i++) {
+              const idx = i + k * P + j * PP;
+              if (!grid[idx] && occ.has(key(x0 + i, y0 + j, z0 + k))) grid[idx] = 0x80;
+            }
+          }
+        }
+      }
+    }
+
+    // Depth: contiguous fluid cells from each fluid cell down.
+    for (let j = 0; j < P; j++) {
+      for (let k = 0; k < P; k++) {
+        for (let i = 0; i < P; i++) {
+          const idx = i + k * P + j * PP;
+          const g = grid[idx];
+          if (!g || (g & 0x80)) continue;
+          if (j > 0) {
+            depth[idx] = Math.min(DEPTH_CAP, depth[idx - PP] + 1);
+          } else {
+            let d = 1;
+            while (d < DEPTH_CAP && fluidAt(key(x0 + i, y0 - d, z0 + k))) d++;
+            depth[idx] = d;
+          }
+        }
+      }
     }
     blocks.push({ bx, by, bz, grid, depth, flow });
     transfer.push(grid.buffer, depth.buffer, flow.buffer);

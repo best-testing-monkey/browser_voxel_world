@@ -47,8 +47,10 @@ nothing to install and starts instantly.
   aligned sub-voxels that fill it (e.g. taking a 10 mm bite out of a
   1000 mm granite block yields 7×500 + 124×100 + 7×50 + 124×10 mm voxels).
 - **Persistent world**: every edit is POSTed to the backend, which stores
-  it in `world_state.json` — changes survive both page reloads *and server
-  restarts*.
+  it in `world_state.db` (SQLite) — changes survive both page reloads *and
+  server restarts*. An existing `world_state.json` from an older version is
+  migrated automatically on first start and kept as
+  `world_state.json.migrated`.
 - **Screen surfaces**: panels of Screen voxels the backend draws
   **Markdown or SVG** onto (`GET/POST /api/screens`). Content is versioned;
   browsers re-render within ~2 s of a change. The demo scene has a
@@ -70,7 +72,15 @@ nothing to install and starts instantly.
   its colour and strength are governed by the glass around it (stained
   glass tints, clear glass brightens, tinted glass dims).
 - **Fluids**: Sand/Water/Lava Faucet blocks pour 5 cm fluid voxels
-  (deliberately a touch slower than the real stuff). Cross effects are
+  (deliberately a touch slower than the real stuff). Water and lava have
+  Minecraft-style fill levels (1–8 eighths per cell) and conserve mass, so
+  pools level out and thin sheets spread across floors; sand piles up and
+  sinks through liquids. The simulation runs in a Web Worker, and a
+  second worker turns the cells into one smooth marching-cubes surface per
+  fluid, drawn with custom shaders: water has rippling normals, fresnel
+  reflection of the sky, depth colouring (clear when shallow, dark blue
+  when deep) and ripples that move with the flow; lava is a slowly
+  flowing, glowing crust. Cross effects are
   backend-configured: lava + water freezes to obsidian, wood burns in
   lava, small wooden voxels float up through water, water cools magma to
   coal — and those effects are persisted world edits. Fluid is
@@ -78,8 +88,8 @@ nothing to install and starts instantly.
   `maxCellsPerType` (default 4000) is a per-tick *movement budget* — when
   more cells are in motion than the budget, each tick steps a rotating
   window of that many cells, so more moving fluid simply moves slower.
-  Cells that reach equilibrium (no movement for `settleAfterTicks`) move
-  to a **settled tier**: they cost nothing per tick, don't consume the
+  Cells that reach equilibrium (no change for `settleAfterTicks` steps)
+  move to a **settled tier**: they cost nothing per tick, don't consume the
   movement budget, and re-render only when the pool changes. Settled
   cells wake when disturbed — a neighbour vacates, a block is placed or
   mined nearby (mining under a pile causes an avalanche), or a reaction
@@ -118,7 +128,7 @@ nothing to install and starts instantly.
 
   Renaming only changes a world's display title; its underlying id (used for
   chunk/edit storage) never changes. Custom worlds persist across restarts
-  in `world_state.json`; deleting one falls back every connected browser to
+  in `world_state.db`; deleting one falls back every connected browser to
   the default scene with a toast. See [API.md](API.md#worlds) for the
   scriptable `GET/POST /api/worlds` endpoint.
 - **Minecraft schematic import** — press **Right Shift+L** while looking at a
@@ -138,7 +148,10 @@ nothing to install and starts instantly.
   the raw file to `POST /api/schematic/import` and polls
   `GET /api/schematic/status` for progress (see
   [API.md](API.md#schematic-import)). Every connected client (not just the
-  one that uploaded it) picks up the result within one poll cycle.
+  one that uploaded it) picks up the result within one poll cycle. If you
+  end up inside the pasted blocks (or inside anything else when a chunk
+  (re)loads around you), you're moved to the nearest free spot: straight
+  up first, then sideways.
 - **Composite object materials** — beyond single-color solid blocks, some
   Minecraft materials are *shapes* built from many small voxels: stairs,
   slabs, fences, panes, doors, trapdoors, pressure plates, buttons,
@@ -172,24 +185,34 @@ nothing to install and starts instantly.
 │ Browser (Three.js)     │ ───────────────────▶  │ Python backend           │
 │  static/js/main.js     │   materials + scenes  │  server.py   (stdlib)    │
 │                        │                       │  materials.py (1024+)    │
-│  - chunk meshing       │   GET /api/chunk      │  worldgen.py  (Perlin)   │
-│  - pointer lock + WASD │ ───────────────────▶  │                          │
-│  - voxel raycasting    │   uint16 voxels (b64) │  scenes generate chunks  │
-│  - hotbar/inventory UI │                       │  16 × 1024 × 16          │
-│                        │   POST /api/edits     │                          │
-│                        │ ───────────────────▶  │  in-memory edit store    │
+│  - pointer lock + WASD │   GET /api/chunk      │  worldgen.py  (Perlin)   │
+│  - voxel raycasting    │ ───────────────────▶  │                          │
+│  - hotbar/inventory UI │  gzip'd binary        │  scenes generate chunks  │
+│                        │  16^3 sections        │  16 × 1024 × 16          │
+│  Web Workers:          │                       │                          │
+│  - mesher.worker.js    │   POST /api/edits     │  storage.py: SQLite,     │
+│  - fluidsim.worker.js  │ ───────────────────▶  │  edits per 16^3 section  │
+│  - fluidmesh.worker.js │                       │                          │
 └────────────────────────┘                       └──────────────────────────┘
 ```
 
 - Chunks are `16 × 1024 × 16` grids of `uint16` material ids (0 = air),
-  transferred base64-encoded and meshed client-side with face culling.
+  split into 16-tall sections. They are transferred as gzip'd binary with
+  all-air sections left out, and stored the same way in the browser.
+- Lighting and meshing (culled faces) run in `mesher.worker.js`, which
+  keeps its own copy of the loaded world; the main thread only streams
+  chunks and edits to it and uploads the finished geometry. Placing or
+  mining a block never waits for a remesh.
 - Sub-voxels (all sizes below 1000 mm) live in a sparse overlay keyed by
   their integer mm origin and size — `(x_mm, y_mm, z_mm, size_mm) → id` —
   sent alongside each chunk and meshed as scaled boxes in the same
   vertex-colored geometry.
 - World edits (`op:"set"` for the base grid, `op:"sub"` for smaller voxels)
-  are validated server-side and written atomically to `world_state.json`
-  after every batch, then reloaded at startup.
+  are validated server-side and kept per 16×16×16 section in SQLite
+  (`world_state.db`). Only the chunk columns in use are loaded into memory,
+  with range queries, and changed sections are flushed in one transaction
+  about once a second. So reading or writing one chunk never touches the
+  rest of the world, even after importing a large schematic.
 - Rendering uses a single vertex-colored `MeshLambertMaterial`; a
   deterministic per-voxel brightness jitter gives stone its speckled look,
   so 1024 materials cost one draw-call material, not 1024.
@@ -201,11 +224,17 @@ nothing to install and starts instantly.
 | Path | Purpose |
 | --- | --- |
 | `server.py` | HTTP server: static files + JSON API (`/api/config`, `/api/chunk`, `/api/edits`, `/api/worlds`, `/api/schematic/*`) |
+| `storage.py` | SQLite world storage: per-section edit overlays, lazy loading, batched flushing, JSON migration |
 | `materials.py` | Builds the 1024+ material catalog, including composite object materials |
 | `worldgen.py` | Perlin noise, the built-in scenes, and the Flat/Perlin/SingleBlock world generators |
 | `schematic_import.py` | Server-side `.schem`/`.schematic` parsing, block mapping, and placement (background job) |
 | `objects/*.txt` | Composite object shape definitions (stairs, fences, panes, torches, ...) |
 | `static/index.html` | UI shell: HUD, hotbar, material browser, inventory, world manager |
-| `static/js/main.js` | Game client: streaming, meshing, controls, editing, world manager UI |
+| `static/js/main.js` | Game client: streaming, controls, editing, unstuck, world manager UI |
+| `static/js/worldstore.js` | Sectioned chunk storage and binary chunk decoding (shared by the page and the workers) |
+| `static/js/mesher.worker.js` | Worker: chunk lighting (`lighting.js`) and meshing |
+| `static/js/fluids.js` | Fluid rendering and shaders; owns the two fluid workers |
+| `static/js/fluidsim.worker.js` | Worker: level-based fluid simulation |
+| `static/js/fluidmesh.worker.js` | Worker: marching-cubes fluid surfaces (tables in `mc_tables.js`) |
 | `static/js/schematic.js` | Footprint-rotation helpers shared by composite object placement |
 | `static/vendor/three.module.js` | Vendored Three.js r160 |
