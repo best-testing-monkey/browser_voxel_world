@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 world_state.json
 world_state.json.tmp
+world_state.db
+world_state.db-*
+world_state.json.migrated

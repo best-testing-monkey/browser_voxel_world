@@ -13,8 +13,13 @@ Supports Sponge/WorldEdit .schem (versions 1-3) and the legacy MCEdit
 import gzip
 import struct
 import zlib
+from array import array
+
+from storage import NO_EDIT
+from worldgen import CHUNK_X, CHUNK_Z
 
 MAX_SCHEMATIC_DIM = 512  # max width/height/length, each axis
+SECTION_H = 16           # must match server.py / storage sections
 
 
 class SchematicTooLarge(Exception):
@@ -292,6 +297,28 @@ def _resolve_legacy_id(block_id, data, name_to_id, unmapped):
 PROGRESS_STEP = 50_000  # cells between progress-callback updates
 
 
+def _section_writer():
+    """Returns (sections, put). put(x, y, z, mat) writes one base-grid cell
+    into a {(cx, cz, sy): array('H')} section overlay map (NO_EDIT marks
+    cells the schematic doesn't touch), so placement never builds a
+    per-cell dict — a 512^3 structure would need gigabytes as tuples."""
+    sections = {}
+    empty = array("H", [NO_EDIT]) * (CHUNK_X * CHUNK_Z * SECTION_H)
+    layer = CHUNK_X * CHUNK_Z
+
+    def put(x, y, z, mat):
+        cx, lx = divmod(x, CHUNK_X)
+        cz, lz = divmod(z, CHUNK_Z)
+        sy, ly = divmod(y, SECTION_H)
+        key = (cx, cz, sy)
+        sec = sections.get(key)
+        if sec is None:
+            sec = sections[key] = array("H", empty)
+        sec[lx + lz * CHUNK_X + ly * layer] = mat
+
+    return sections, put
+
+
 def _parse_sponge_and_place(root, name_to_id, target, normal, chunk_y,
                              progress_cb):
     is_v3 = (root.get("Version") or 1) >= 3 and isinstance(
@@ -325,7 +352,8 @@ def _parse_sponge_and_place(root, name_to_id, target, normal, chunk_y,
         oy = max(0, chunk_y - height)
 
     total = width * height * length
-    edits = {}
+    sections, put = _section_writer()
+    placed = 0
     pos = 0
     processed = 0
     for y in range(height):
@@ -347,11 +375,12 @@ def _parse_sponge_and_place(root, name_to_id, target, normal, chunk_y,
                     progress_cb(processed, total)
                 if in_y_range:
                     nx, nz = _rotate_xz(x, z, width, length, steps)
-                    edits[(ox + nx, wy, oz + nz)] = palette_to_mat[value]
+                    put(ox + nx, wy, oz + nz, palette_to_mat[value])
+                    placed += 1
     if progress_cb:
         progress_cb(total, total)
     bbox = (ox, oy, oz, ox + width2, oy + height, oz + length2)
-    return edits, sorted(unmapped), bbox
+    return sections, placed, sorted(unmapped), bbox
 
 
 def _parse_legacy_and_place(root, name_to_id, target, normal, chunk_y,
@@ -377,7 +406,8 @@ def _parse_legacy_and_place(root, name_to_id, target, normal, chunk_y,
         oy = max(0, chunk_y - height)
 
     total = width * height * length
-    edits = {}
+    sections, put = _section_writer()
+    placed = 0
     processed = 0
     i = 0
     for y in range(height):
@@ -398,11 +428,12 @@ def _parse_legacy_and_place(root, name_to_id, target, normal, chunk_y,
                     progress_cb(processed, total)
                 if in_y_range:
                     nx, nz = _rotate_xz(x, z, width, length, steps)
-                    edits[(ox + nx, wy, oz + nz)] = mat
+                    put(ox + nx, wy, oz + nz, mat)
+                    placed += 1
     if progress_cb:
         progress_cb(total, total)
     bbox = (ox, oy, oz, ox + width2, oy + height, oz + length2)
-    return edits, sorted(unmapped), bbox
+    return sections, placed, sorted(unmapped), bbox
 
 
 def parse_and_place(raw_bytes, name_to_id, target, normal, chunk_y,
@@ -414,8 +445,10 @@ def parse_and_place(raw_bytes, name_to_id, target, normal, chunk_y,
     `progress_cb(processed, total)` is called periodically during the
     (potentially long) per-cell decode/placement loop.
 
-    Returns (edits, unmapped, bbox):
-      edits: {(x, y, z): material_id} in world/base-grid coordinates
+    Returns (sections, placed, unmapped, bbox):
+      sections: {(cx, cz, sy): array('H')} 16^3 section overlays in
+        world/base-grid coordinates (storage.NO_EDIT = cell not touched)
+      placed: number of cells written
       unmapped: sorted list of block names/ids that fell back to Stone
       bbox: (x0, y0, z0, x1, y1, z1) — half-open world-space bounding box
 

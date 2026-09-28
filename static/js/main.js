@@ -1,7 +1,8 @@
 import * as THREE from '/vendor/three.module.js';
 import { createScreenManager } from '/js/screens.js';
 import { createFluidSim } from '/js/fluids.js';
-import { createLightEngine } from '/js/lighting.js';
+import { createWorldStore, decodeChunkBinary, chunkKey, subKey }
+  from '/js/worldstore.js';
 import { rotateAndNormalize, stepsFromNormal } from '/js/schematic.js';
 
 // ---------------------------------------------------------------------------
@@ -55,8 +56,7 @@ const state = {
 };
 
 let screenMgr = null;           // created once config is loaded
-let fluidSim = null;
-let lightEngine = null;         // voxel flood-fill lighting
+let fluidSim = null;            // fluid workers + surface rendering
 
 const toolSizeMm = () => state.sizesMm[state.sizeIdx];
 
@@ -205,10 +205,6 @@ chunkMaterial.onBeforeCompile = (shader) => {
       `min(vec3(1.2), vec3(${MIN_LIGHT}) + vBlock + vSky * uDay);`);
 };
 
-// Light-level (0..15) to brightness, Minecraft-ish response curve.
-const LIGHT_CURVE = Array.from({ length: 16 },
-  (_, i) => Math.pow(i / 15, 1.6));
-
 // Highlight wireframe for the targeted voxel (unit cube, scaled per target)
 const highlight = new THREE.LineSegments(
   new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 1.002)),
@@ -223,111 +219,74 @@ window.addEventListener('resize', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Voxel access (base grid: 1000 mm cells addressed in cell units)
+// Voxel access (base grid: 1000 mm cells addressed in cell units). Chunks
+// are stored in 16-tall sections (worldstore.js). The mesher worker and the
+// fluid simulation worker each keep their own copy of the loaded world,
+// kept in sync by broadcasting chunk loads/unloads and every edit to them.
 // ---------------------------------------------------------------------------
-const chunkKey = (cx, cz) => `${cx},${cz}`;
-const subKey = (x, y, z, s) => `${x},${y},${z},${s}`;
+let world = null;               // createWorldStore(), once config is known
+let mesher = null;              // chunk lighting + meshing worker
+const worldWorkers = [];        // every worker that mirrors the world
+let sceneEpoch = 0;             // bumps on scene switch; stale replies drop
 
 function chunkAtCell(wx, wz) {
-  return state.chunks.get(
-    chunkKey(Math.floor(wx / CX), Math.floor(wz / CZ)));
+  return world ? world.chunkAt(wx, wz) : undefined;
 }
 
 function getVoxel(wx, wy, wz) {
-  if (wy < 0 || wy >= CY) return 0;
-  const chunk = chunkAtCell(wx, wz);
-  if (!chunk || !chunk.data) return 0;
-  const lx = wx - Math.floor(wx / CX) * CX;
-  const lz = wz - Math.floor(wz / CZ) * CZ;
-  return chunk.data[lx + lz * CX + wy * CX * CZ];
+  return world ? world.getVoxel(wx, wy, wz) : 0;
 }
 
 function setVoxel(wx, wy, wz, matId, sync = true) {
-  if (wy < 0 || wy >= CY) return false;
-  const cx = Math.floor(wx / CX), cz = Math.floor(wz / CZ);
-  const chunk = state.chunks.get(chunkKey(cx, cz));
-  if (!chunk || !chunk.data) return false;
-  const lx = wx - cx * CX, lz = wz - cz * CZ;
-  chunk.data[lx + lz * CX + wy * CX * CZ] = matId;
-  rebuildChunk(chunk);
-  // Rebuild neighbours when editing a border voxel so culled faces update.
-  if (lx === 0) rebuildChunkAt(cx - 1, cz);
-  if (lx === CX - 1) rebuildChunkAt(cx + 1, cz);
-  if (lz === 0) rebuildChunkAt(cx, cz - 1);
-  if (lz === CZ - 1) rebuildChunkAt(cx, cz + 1);
+  if (!world || !world.setVoxel(wx, wy, wz, matId)) return false;
+  queueWorkerEdit(wx, wy, wz, matId);
   if (sync) pushEdit({ op: 'set', x: wx, y: wy, z: wz, id: matId });
-  if (fluidSim) fluidSim.disturbBlock(wx, wy, wz);
-  if (lightEngine) lightEngine.markDirty(cx, cz, remeshRelit);
   return true;
 }
 
-// Sub-voxels: sparse, keyed by mm-aligned origin + size. `rebuild` lets
-// callers batch many changes into one mesh rebuild.
+// Sub-voxels: sparse, keyed by mm-aligned origin + size. Meshing happens
+// asynchronously in the worker, which coalesces bursts of edits itself, so
+// `rebuild` is only kept for call-site compatibility.
 function chunkAtMm(xMm, zMm) {
-  return state.chunks.get(chunkKey(
-    Math.floor(xMm / (CX * MM)), Math.floor(zMm / (CZ * MM))));
+  return world ? world.subChunkAt(xMm, zMm) : undefined;
 }
 
 function setSubVoxel(xMm, yMm, zMm, sizeMm, matId, rebuild = true,
                      sync = true) {
-  const chunk = chunkAtMm(xMm, zMm);
-  if (!chunk) return false;
-  const key = subKey(xMm, yMm, zMm, sizeMm);
-  if (matId === 0) chunk.sub.delete(key);
-  else chunk.sub.set(key, { x: xMm, y: yMm, z: zMm, s: sizeMm, mat: matId });
+  if (!world || !world.setSub(xMm, yMm, zMm, sizeMm, matId)) return false;
+  queueWorkerSubEdit(xMm, yMm, zMm, sizeMm, matId);
   if (sync) pushEdit({ op: 'sub', x: xMm, y: yMm, z: zMm, s: sizeMm, id: matId });
-  if (rebuild) rebuildChunk(chunk);
-  if (fluidSim) fluidSim.disturbMm(xMm, yMm, zMm, sizeMm);
-  if (lightEngine && rebuild) {
-    lightEngine.markDirty(chunk.cx, chunk.cz, remeshRelit);
-  }
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// 50 mm cell queries for the fluid simulation. Chunks keep an occupancy set
-// of sub-voxel-covered cells (built during meshing) so lookups stay O(1).
-// ---------------------------------------------------------------------------
-const CELLS_PER_BLOCK = 20;    // 1000 mm / 50 mm
-const cellKey = (x, y, z) => `${x},${y},${z}`;
+// Edits reach the workers in one message per task (flushed in a
+// microtask), however many cells an action changed.
+let workerBase = [];
+let workerSubs = [];
+let workerFlushQueued = false;
 
-function isSolidCell(cx, cy, cz) {
-  const bx = Math.floor(cx / CELLS_PER_BLOCK);
-  const by = Math.floor(cy / CELLS_PER_BLOCK);
-  const bz = Math.floor(cz / CELLS_PER_BLOCK);
-  if (by < 0 || by >= CY) return false;
-  if (getVoxel(bx, by, bz)) return true;
-  const chunk = chunkAtCell(bx, bz);
-  return !!(chunk && chunk.subCells && chunk.subCells.has(cellKey(cx, cy, cz)));
+function queueWorkerFlush() {
+  if (workerFlushQueued) return;
+  workerFlushQueued = true;
+  queueMicrotask(() => {
+    workerFlushQueued = false;
+    if (!workerBase.length && !workerSubs.length) return;
+    const msg = { type: 'edits', base: Int32Array.from(workerBase),
+                  subs: workerSubs };
+    workerBase = [];
+    workerSubs = [];
+    for (const w of worldWorkers) w.postMessage(msg);
+  });
 }
 
-// Returns the block occupying a 50 mm cell:
-// {kind:'base', x,y,z, id} or {kind:'sub', x,y,z,s (mm), id} or null.
-function blockAtCell(cx, cy, cz) {
-  const bx = Math.floor(cx / CELLS_PER_BLOCK);
-  const by = Math.floor(cy / CELLS_PER_BLOCK);
-  const bz = Math.floor(cz / CELLS_PER_BLOCK);
-  const base = getVoxel(bx, by, bz);
-  if (base) return { kind: 'base', x: bx, y: by, z: bz, id: base };
-  const chunk = chunkAtCell(bx, bz);
-  if (!chunk || !chunk.subCells ||
-      !chunk.subCells.has(cellKey(cx, cy, cz))) return null;
-  const xMm = cx * 50, yMm = cy * 50, zMm = cz * 50;
-  for (const sv of chunk.sub.values()) {
-    if (xMm >= sv.x && xMm < sv.x + sv.s &&
-        yMm >= sv.y && yMm < sv.y + sv.s &&
-        zMm >= sv.z && zMm < sv.z + sv.s) {
-      return { kind: 'sub', x: sv.x, y: sv.y, z: sv.z, s: sv.s, id: sv.mat };
-    }
-  }
-  return null;
+function queueWorkerEdit(x, y, z, id) {
+  workerBase.push(x, y, z, id);
+  queueWorkerFlush();
 }
 
-function subExactAtCell(cx, cy, cz) {
-  const chunk = chunkAtCell(Math.floor(cx / CELLS_PER_BLOCK),
-                            Math.floor(cz / CELLS_PER_BLOCK));
-  if (!chunk) return null;
-  return chunk.sub.get(subKey(cx * 50, cy * 50, cz * 50, 50)) || null;
+function queueWorkerSubEdit(x, y, z, s, id) {
+  workerSubs.push([x, y, z, s, id]);
+  queueWorkerFlush();
 }
 
 function loadedFaucets() {
@@ -337,17 +296,6 @@ function loadedFaucets() {
   }
   return out;
 }
-
-function rebuildChunkAt(cx, cz) {
-  const chunk = state.chunks.get(chunkKey(cx, cz));
-  if (chunk && chunk.data) rebuildChunk(chunk);
-}
-
-// After a relight pass, re-mesh every chunk whose light field changed.
-function remeshRelit(chunks) {
-  for (const chunk of chunks) rebuildChunk(chunk);
-}
-
 // ---------------------------------------------------------------------------
 // Voxel decomposition ("comprised of smaller voxels")
 //
@@ -376,195 +324,98 @@ function decompose(ox, oy, oz, size, tx, ty, tz, ts, out) {
 }
 
 // ---------------------------------------------------------------------------
-// Meshing: culled cube faces for the base grid plus boxes for sub-voxels,
-// vertex-coloured per material with a per-voxel brightness jitter (this is
-// what makes granite look speckled).
+// Chunk meshes arrive from the mesher worker as ready-made typed arrays:
+// culled cube faces for the base grid plus boxes for sub-voxels, with
+// per-vertex colour and baked sky/block light (all normalised bytes).
 // ---------------------------------------------------------------------------
-const FACES = [
-  { dir: [1, 0, 0], corners: [[1,1,1],[1,0,1],[1,1,0],[1,0,0]], shade: 0.80 },
-  { dir: [-1,0, 0], corners: [[0,1,0],[0,0,0],[0,1,1],[0,0,1]], shade: 0.80 },
-  { dir: [0, 1, 0], corners: [[0,1,1],[1,1,1],[0,1,0],[1,1,0]], shade: 1.00 },
-  { dir: [0,-1, 0], corners: [[0,0,0],[1,0,0],[0,0,1],[1,0,1]], shade: 0.55 },
-  { dir: [0, 0, 1], corners: [[1,1,1],[0,1,1],[1,0,1],[0,0,1]], shade: 0.72 },
-  { dir: [0, 0,-1], corners: [[0,1,0],[1,1,0],[0,0,0],[1,0,0]], shade: 0.72 },
-];
-
-const matColorCache = [];
-function materialRGB(matId) {
-  let c = matColorCache[matId];
-  if (!c) {
-    const hex = state.materials[matId] ? state.materials[matId].color : '#ff00ff';
-    c = [parseInt(hex.slice(1, 3), 16) / 255,
-         parseInt(hex.slice(3, 5), 16) / 255,
-         parseInt(hex.slice(5, 7), 16) / 255];
-    matColorCache[matId] = c;
-  }
-  return c;
-}
-
-// Deterministic per-voxel jitter in [0.90, 1.10]
-function voxelJitter(x, y, z) {
-  let h = (x * 374761393 + y * 668265263 + z * 2147483647) | 0;
-  h = (h ^ (h >> 13)) * 1274126177 | 0;
-  return 0.90 + ((h >>> 16) & 0xff) / 255 * 0.20;
-}
-
-function rebuildChunk(chunk) {
-  const positions = [], normals = [], colors = [], indices = [];
-  const skys = [], blocks = [];
-  const ox = chunk.cx * CX, oz = chunk.cz * CZ;
-  const layer = CX * CZ;
-
-  // Baked voxel light for a face: sample the air cell the face looks into.
-  // Returns curved RGB for both channels.
-  const faceLight = (x, y, z) => {
-    if (!lightEngine) return [[1, 1, 1], [0, 0, 0]];
-    const l = lightEngine.lightAt(x, y, z);
-    return [
-      [LIGHT_CURVE[l.sky[0]], LIGHT_CURVE[l.sky[1]], LIGHT_CURVE[l.sky[2]]],
-      [LIGHT_CURVE[l.block[0]], LIGHT_CURVE[l.block[1]],
-       LIGHT_CURVE[l.block[2]]],
-    ];
-  };
-
-  const emitBox = (bx, by, bz, size, matId, jitter, cullFn, lightFn) => {
-    const rgb = materialRGB(matId);
-    for (const face of FACES) {
-      if (cullFn && cullFn(face)) continue;
-      const [skyC, blockC] = lightFn(face);
-      const base = positions.length / 3;
-      for (const c of face.corners) {
-        positions.push(bx + c[0] * size, by + c[1] * size, bz + c[2] * size);
-        normals.push(...face.dir);
-        const s = face.shade * jitter;
-        colors.push(
-          Math.min(1, rgb[0] * s),
-          Math.min(1, rgb[1] * s),
-          Math.min(1, rgb[2] * s));
-        skys.push(skyC[0], skyC[1], skyC[2]);
-        blocks.push(blockC[0], blockC[1], blockC[2]);
-      }
-      indices.push(base, base + 1, base + 2, base + 2, base + 1, base + 3);
-    }
-  };
-
-  // Base grid: full 1000 mm voxels with neighbour face culling. While we
-  // scan, collect lamps and fluid faucets for the light/fluid systems, and
-  // (since y ascends) the highest occupied cell per column — the light
-  // engine uses this to skip scanning empty sky far above the terrain,
-  // which matters once CY is much taller than any real terrain gets.
-  chunk.lamps = [];
-  chunk.faucets = [];
-  chunk.topY = new Int16Array(layer).fill(-1);
-  for (let y = 0; y < CY; y++) {
-    for (let z = 0; z < CZ; z++) {
-      for (let x = 0; x < CX; x++) {
-        const matId = chunk.data[x + z * CX + y * layer];
-        if (!matId) continue;
-        chunk.topY[x + z * CX] = y;
-        const wx = ox + x, wz = oz + z;
-        const action = state.materials[matId] && state.materials[matId].action;
-        if (action === 'lamp') chunk.lamps.push({ x: wx, y, z: wz });
-        else if (action === 'faucet') {
-          chunk.faucets.push({ x: wx, y, z: wz, id: matId });
-        }
-        emitBox(wx, y, wz, 1, matId, voxelJitter(wx, y, wz),
-          (face) => getVoxel(wx + face.dir[0], y + face.dir[1],
-                             wz + face.dir[2]) !== 0,
-          (face) => faceLight(wx + face.dir[0], y + face.dir[1],
-                              wz + face.dir[2]));
-      }
-    }
-  }
-
-  // Sub-voxel overlay: smaller variable-size voxels (positions in mm).
-  // Also refresh the 50 mm occupancy set used by the fluid simulation.
-  chunk.subCells = new Set();
-  for (const sv of chunk.sub.values()) {
-    // A sub-voxel's containing cell also needs a correct light value (its
-    // faces sample it below), even when it sits above the highest *base*
-    // voxel in this column — e.g. a torch or any object placed on top of
-    // the terrain. Extend topY (see the base-grid loop above) so the light
-    // engine doesn't wrongly treat that cell as untouched open sky.
-    const svBlockY = Math.floor(sv.y / MM);
-    const svCol = (Math.floor(sv.x / MM) - ox) + (Math.floor(sv.z / MM) - oz) * CX;
-    if (svBlockY > chunk.topY[svCol]) chunk.topY[svCol] = svBlockY;
-    // Sub-voxels sample the light of their containing 1 m cell.
-    const cellLight = faceLight(
-      Math.floor(sv.x / MM), Math.floor(sv.y / MM), Math.floor(sv.z / MM));
-    emitBox(sv.x / MM, sv.y / MM, sv.z / MM, sv.s / MM, sv.mat,
-      voxelJitter(sv.x / 10 | 0, sv.y / 10 | 0, sv.z / 10 | 0), null,
-      () => cellLight);
-    const n = sv.s / 50;
-    const cx0 = sv.x / 50, cy0 = sv.y / 50, cz0 = sv.z / 50;
-    for (let i = 0; i < n; i++) {
-      for (let j = 0; j < n; j++) {
-        for (let k = 0; k < n; k++) {
-          chunk.subCells.add(cellKey(cx0 + i, cy0 + j, cz0 + k));
-        }
-      }
-    }
-  }
-
+function setChunkMesh(chunk, g) {
   if (chunk.mesh) {
     scene3.remove(chunk.mesh);
     chunk.mesh.geometry.dispose();
     chunk.mesh = null;
   }
-  if (!positions.length) return;
-
+  if (!g) return;
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-  geo.setAttribute('aSky', new THREE.Float32BufferAttribute(skys, 3));
-  geo.setAttribute('aBlock', new THREE.Float32BufferAttribute(blocks, 3));
-  geo.setIndex(indices);
+  geo.setAttribute('position', new THREE.BufferAttribute(g.positions, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(g.normals, 3, true));
+  geo.setAttribute('color', new THREE.BufferAttribute(g.colors, 3, true));
+  geo.setAttribute('aSky', new THREE.BufferAttribute(g.sky, 3, true));
+  geo.setAttribute('aBlock', new THREE.BufferAttribute(g.block, 3, true));
+  geo.setIndex(new THREE.BufferAttribute(g.indices, 1));
+  geo.computeBoundingSphere();
   chunk.mesh = new THREE.Mesh(geo, chunkMaterial);
   chunk.mesh.frustumCulled = true;
   scene3.add(chunk.mesh);
 }
 
+function onMesherMessage(e) {
+  const msg = e.data;
+  if (msg.epoch !== sceneEpoch) return; // reply for a previous scene
+  if (msg.type === 'mesh') {
+    const chunk = state.chunks.get(chunkKey(msg.cx, msg.cz));
+    if (!chunk) return;
+    chunk.lamps = msg.lamps;
+    chunk.faucets = msg.faucets;
+    setChunkMesh(chunk, msg.geometry);
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Chunk streaming from the Python backend
+// Chunk streaming from the Python backend: gzip'd binary sections (all-air
+// sections are never sent), decoded here and mirrored to the workers.
 // ---------------------------------------------------------------------------
 let fetchesInFlight = 0;
-
-function decodeVoxels(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new Uint16Array(bytes.buffer);
-}
+const MAX_FETCHES = 6;
 
 async function fetchChunk(cx, cz) {
   const key = chunkKey(cx, cz);
+  const sceneName = state.scene.name;
+  const epoch = sceneEpoch;
   state.pending.add(key);
   fetchesInFlight++;
   try {
     const res = await fetch(
-      `/api/chunk?scene=${state.scene.name}&cx=${cx}&cz=${cz}`);
+      `/api/chunk?scene=${sceneName}&cx=${cx}&cz=${cz}&format=bin`);
     if (!res.ok) throw new Error(`chunk ${key}: HTTP ${res.status}`);
-    const payload = await res.json();
-    if (payload.scene !== state.scene.name) return; // scene switched mid-fetch
-    const sub = new Map();
-    for (const [x, y, z, s, mat] of payload.subvoxels || []) {
-      sub.set(subKey(x, y, z, s), { x, y, z, s, mat });
-    }
-    const chunk = { cx, cz, data: decodeVoxels(payload.voxels), sub, mesh: null };
-    state.chunks.set(key, chunk);
-    rebuildChunk(chunk);
-    // Refresh neighbours so their border faces get culled/created correctly.
-    rebuildChunkAt(cx - 1, cz);
-    rebuildChunkAt(cx + 1, cz);
-    rebuildChunkAt(cx, cz - 1);
-    rebuildChunkAt(cx, cz + 1);
-    if (lightEngine) lightEngine.markDirty(cx, cz, remeshRelit);
+    const buf = await res.arrayBuffer();
+    if (epoch !== sceneEpoch) return; // scene switched mid-fetch
+    installChunk(decodeChunkBinary(buf, world));
   } catch (err) {
     console.error(err);
   } finally {
-    state.pending.delete(key);
+    if (epoch === sceneEpoch) state.pending.delete(key);
     fetchesInFlight--;
+  }
+}
+
+function installChunk({ cx, cz, sections, subs }) {
+  const key = chunkKey(cx, cz);
+  const old = state.chunks.get(key);
+  const chunk = world.makeChunk(cx, cz, sections, subs);
+  if (old) {
+    // A refetch (bulk edit): keep showing the old mesh until the new one
+    // arrives from the worker.
+    chunk.mesh = old.mesh;
+    chunk.lamps = old.lamps;
+    chunk.faucets = old.faucets;
+  }
+  state.chunks.set(key, chunk);
+  for (const w of worldWorkers) {
+    const copies = sections.map(({ sy, data }) => ({ sy, data: data.slice() }));
+    w.postMessage({ type: 'load', cx, cz, sections: copies, subs },
+                  copies.map((s) => s.data.buffer));
+  }
+  if (chunkTouchesPlayer(cx, cz)) ensureNotStuck();
+}
+
+function unloadChunk(key, chunk) {
+  if (chunk.mesh) {
+    scene3.remove(chunk.mesh);
+    chunk.mesh.geometry.dispose();
+  }
+  state.chunks.delete(key);
+  for (const w of worldWorkers) {
+    w.postMessage({ type: 'unload', cx: chunk.cx, cz: chunk.cz });
   }
 }
 
@@ -572,16 +423,15 @@ function updateChunks() {
   if (!state.scene) return;
   const pcx = Math.floor(state.pos.x / CX);
   const pcz = Math.floor(state.pos.z / CZ);
+  for (const w of worldWorkers) {
+    w.postMessage({ type: 'focus', x: state.pos.x, z: state.pos.z });
+  }
 
   // Unload far chunks
   for (const [key, chunk] of state.chunks) {
     if (Math.abs(chunk.cx - pcx) > UNLOAD_RADIUS ||
         Math.abs(chunk.cz - pcz) > UNLOAD_RADIUS) {
-      if (chunk.mesh) {
-        scene3.remove(chunk.mesh);
-        chunk.mesh.geometry.dispose();
-      }
-      state.chunks.delete(key);
+      unloadChunk(key, chunk);
     }
   }
 
@@ -598,11 +448,73 @@ function updateChunks() {
   }
   wanted.sort((a, b) => a.d - b.d);
   for (const w of wanted) {
-    if (fetchesInFlight >= 4) break;
+    if (fetchesInFlight >= MAX_FETCHES) break;
     fetchChunk(w.cx, w.cz);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Getting unstuck: when a chunk (re)loads under the player — entering a
+// world, a schematic pasted on top of them, another player's bulk edit —
+// and they end up inside solid blocks, move them to the nearest free spot:
+// straight up first, then sideways in growing rings.
+// ---------------------------------------------------------------------------
+const UNSTUCK_UP = 64;      // blocks to search straight up first
+const UNSTUCK_RADIUS = 24;  // then sideways rings up to this radius
+const UNSTUCK_RISE = 6;     // ...each trying this many levels up
+
+function chunkTouchesPlayer(cx, cz) {
+  const p = state.pos;
+  return Math.floor((p.x - PLAYER_HALF) / CX) <= cx &&
+    cx <= Math.floor((p.x + PLAYER_HALF) / CX) &&
+    Math.floor((p.z - PLAYER_HALF) / CZ) <= cz &&
+    cz <= Math.floor((p.z + PLAYER_HALF) / CZ);
+}
+
+// Eye height for standing with feet on top of base cell row `feetY`.
+const eyeAtFeet = (feetY) => feetY + PLAYER_DOWN + 0.001;
+
+function findFreeSpot(p) {
+  const feet = Math.floor(p.y - PLAYER_DOWN);
+  for (let fy = feet + 1; fy <= Math.min(CY, feet + UNSTUCK_UP); fy++) {
+    if (!boxCollides(p.x, eyeAtFeet(fy), p.z)) {
+      return new THREE.Vector3(p.x, eyeAtFeet(fy), p.z);
+    }
+  }
+  // Sideways: block-centred positions on rings of growing radius.
+  const bx = Math.floor(p.x), bz = Math.floor(p.z);
+  for (let r = 1; r <= UNSTUCK_RADIUS; r++) {
+    for (let rise = 0; rise <= UNSTUCK_RISE; rise++) {
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dz = -r; dz <= r; dz++) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+          const x = bx + dx + 0.5, z = bz + dz + 0.5;
+          const y = eyeAtFeet(feet + rise);
+          if (!boxCollides(x, y, z)) return new THREE.Vector3(x, y, z);
+        }
+      }
+    }
+  }
+  // Last resort: all the way up, above everything in this column.
+  for (let fy = feet + UNSTUCK_UP; fy <= CY; fy++) {
+    if (!boxCollides(p.x, eyeAtFeet(fy), p.z)) {
+      return new THREE.Vector3(p.x, eyeAtFeet(fy), p.z);
+    }
+  }
+  return null;
+}
+
+function ensureNotStuck() {
+  if (state.noclip || !state.started) return false;
+  const p = state.pos;
+  if (!boxCollides(p.x, p.y, p.z)) return false;
+  const spot = findFreeSpot(p);
+  if (!spot) return false;
+  p.copy(spot);
+  state.vy = 0;
+  showToast('Moved you out of solid blocks');
+  return true;
+}
 // ---------------------------------------------------------------------------
 // Edit sync back to the backend (batched); the backend persists to disk so
 // world changes survive server restarts.
@@ -636,64 +548,32 @@ function pushEdit(edit) {
 }
 
 // ---------------------------------------------------------------------------
-// Bulk voxel apply: shared by schematic import and composite object
-// placement (Part 3). Naively calling setVoxel/setSubVoxel per cell would
-// rebuild the chunk mesh (and relight) once per cell — far too slow for
-// thousands of cells. This groups cells by chunk, writes directly into
-// each loaded chunk's buffers, then rebuilds/relights each touched chunk
-// exactly once. Cells whose chunk isn't loaded locally are simply queued
-// for the backend (applyRemoteEdit already tolerates unloaded chunks the
-// same way once they stream in normally).
+// Bulk voxel apply: shared by composite object placement and anything else
+// that changes many cells at once. Writes go straight into the local chunk
+// sections; the workers receive all of them in one batched message and
+// re-light/re-mesh each touched chunk once. Cells whose chunk isn't loaded
+// locally are still queued for the backend (they stream in normally).
 //
 // `sizeMm === MM` (1000): cells are {x,y,z,mat} in BLOCK coordinates
 // (base grid), matching setVoxel(). Otherwise cells are {x,y,z,mat} in
 // integer MM coordinates aligned to `sizeMm`, matching setSubVoxel().
 function applyVoxelCells(cells, sizeMm) {
-  const touched = new Set();
   for (const cell of cells) {
     if (sizeMm === MM) {
       if (cell.y < 0 || cell.y >= CY) continue;
-      const cx = Math.floor(cell.x / CX), cz = Math.floor(cell.z / CZ);
-      const chunk = state.chunks.get(chunkKey(cx, cz));
-      if (chunk && chunk.data) {
-        const lx = cell.x - cx * CX, lz = cell.z - cz * CZ;
-        chunk.data[lx + lz * CX + cell.y * CX * CZ] = cell.mat;
-        touched.add(chunkKey(cx, cz));
-        if (lx === 0) touched.add(chunkKey(cx - 1, cz));
-        if (lx === CX - 1) touched.add(chunkKey(cx + 1, cz));
-        if (lz === 0) touched.add(chunkKey(cx, cz - 1));
-        if (lz === CZ - 1) touched.add(chunkKey(cx, cz + 1));
+      if (world.setVoxel(cell.x, cell.y, cell.z, cell.mat)) {
+        queueWorkerEdit(cell.x, cell.y, cell.z, cell.mat);
       }
       pushEdit({ op: 'set', x: cell.x, y: cell.y, z: cell.z, id: cell.mat });
-      if (fluidSim) fluidSim.disturbBlock(cell.x, cell.y, cell.z);
     } else {
-      const chunk = chunkAtMm(cell.x, cell.z);
-      if (chunk) {
-        const key = subKey(cell.x, cell.y, cell.z, sizeMm);
-        if (cell.mat === 0) chunk.sub.delete(key);
-        else {
-          chunk.sub.set(key,
-            { x: cell.x, y: cell.y, z: cell.z, s: sizeMm, mat: cell.mat });
-        }
-        touched.add(chunkKey(chunk.cx, chunk.cz));
+      if (world.setSub(cell.x, cell.y, cell.z, sizeMm, cell.mat)) {
+        queueWorkerSubEdit(cell.x, cell.y, cell.z, sizeMm, cell.mat);
       }
       pushEdit({ op: 'sub', x: cell.x, y: cell.y, z: cell.z, s: sizeMm,
                 id: cell.mat });
-      if (fluidSim) fluidSim.disturbMm(cell.x, cell.y, cell.z, sizeMm);
-    }
-  }
-  for (const key of touched) {
-    const chunk = state.chunks.get(key);
-    if (chunk && chunk.data) rebuildChunk(chunk);
-  }
-  if (lightEngine) {
-    for (const key of touched) {
-      const [cx, cz] = key.split(',').map(Number);
-      lightEngine.markDirty(cx, cz, remeshRelit);
     }
   }
 }
-
 // ---------------------------------------------------------------------------
 // Composite object placement (Part 3): materials with `object: true` place
 // like any other material — at the normal adjacent block-grid cell that
@@ -1010,13 +890,7 @@ function destroyBlock() {
     for (const [x, y, z, s] of remainder) {
       setSubVoxel(x, y, z, s, t.matId, false);
     }
-    if (t.kind === 'base') {
-      // setVoxel rebuilds the chunk, which also picks up the new sub-voxels.
-      setVoxel(t.base.x, t.base.y, t.base.z, 0);
-    } else {
-      const chunk = chunkAtMm(t.sub.x, t.sub.z);
-      if (chunk) rebuildChunk(chunk);
-    }
+    if (t.kind === 'base') setVoxel(t.base.x, t.base.y, t.base.z, 0);
     storeBlock(t.matId);
     return;
   }
@@ -1073,10 +947,7 @@ function clearSubsInBox(x, y, z, size) {
     state.inventory.set(container.mat, storedCount(container.mat) + 1);
     removed++;
   }
-  if (removed) {
-    renderHotbar();
-    rebuildChunk(chunk);
-  }
+  if (removed) renderHotbar();
 }
 
 function subOverlaps(xMm, yMm, zMm, sMm) {
@@ -1743,8 +1614,6 @@ el('schem-file-input').addEventListener('change', handleSchemFileChange);
 const clock = new THREE.Clock();
 let lastChunkUpdate = 0;
 let lastLampUpdate = 0;
-let fluidAcc = 0;
-const FLUID_TICK = 0.1; // seconds; the config's tickMs is advisory
 
 // Player collision: an axis-aligned box around the camera (eye point) that
 // may not intersect solid matter — base voxels or sub-voxels of any size.
@@ -1861,13 +1730,7 @@ function animate() {
       updateLampLights();
       updatePressure();
     }
-    if (fluidSim) {
-      fluidAcc += dt;
-      while (fluidAcc >= FLUID_TICK) {
-        fluidAcc -= FLUID_TICK;
-        fluidSim.tick();
-      }
-    }
+    if (fluidSim) fluidSim.frame(dt, camera, _sunDir, skyColor, dayUniform.value);
 
     state.target = raycastVoxel();
     updateLightGaze();
@@ -1901,7 +1764,11 @@ function clearWorld() {
   }
   state.chunks.clear();
   state.pending.clear();
-  if (lightEngine) lightEngine.reset();
+  sceneEpoch++;
+  for (const w of worldWorkers) {
+    w.postMessage({ type: 'clear', epoch: sceneEpoch });
+  }
+  if (fluidSim) fluidSim.clear();
 }
 
 async function activateScene(meta) {
@@ -1911,7 +1778,6 @@ async function activateScene(meta) {
   [state.yaw, state.pitch] = meta.look || [Math.PI * 0.25, -0.25];
   state.lightGaze = null;
   state.pressureCell = null;
-  if (fluidSim) fluidSim.clear();
   if (screenMgr) {
     screenMgr.clear();
     screenMgr.load();
@@ -1949,9 +1815,8 @@ async function boot() {
   }
 
   [CX, CY, CZ] = state.config.chunkSize;
-  lightEngine = createLightEngine({
-    state, dims: { CX, CY, CZ }, getVoxel,
-  });
+  world = createWorldStore({ CX, CY, CZ });
+  state.chunks = world.chunks;
   if (state.config.voxelSizesMm) {
     state.sizesMm = state.config.voxelSizesMm.map((s) => s | 0);
     state.sizeIdx = Math.max(
@@ -1968,6 +1833,19 @@ async function boot() {
     materialList.appendChild(opt);
   }
 
+  // Workers get the material properties they need (colour, light, action).
+  const workerMaterials = state.config.materials.map((m) => ({
+    id: m.id, color: m.color, translucent: !!m.translucent,
+    emissive: m.emissive || 0, action: m.action || null,
+    flammable: !!m.flammable,
+  }));
+  mesher = new Worker('/js/mesher.worker.js', { type: 'module' });
+  mesher.onmessage = onMesherMessage;
+  mesher.onerror = (e) => console.error('mesher worker error', e.message || e);
+  mesher.postMessage({ type: 'init', dims: { CX, CY, CZ },
+                       materials: workerMaterials });
+  worldWorkers.push(mesher);
+
   screenMgr = createScreenManager({
     THREE, scene3,
     getSceneName: () => (state.scene ? state.scene.name : ''),
@@ -1975,17 +1853,18 @@ async function boot() {
   fluidSim = createFluidSim({
     THREE, scene3,
     config: state.config.fluids || {},
-    materials: state.materials,
+    dims: { CX, CY, CZ },
+    materials: workerMaterials,
     toast: showToast,
-    world: {
-      isSolidCell,
-      blockAtCell,
-      subExactAtCell,
-      faucets: loadedFaucets,
-      setBase: (x, y, z, id) => setVoxel(x, y, z, id),
-      setSub: (x, y, z, s, id) => setSubVoxel(x, y, z, s, id),
+    getEpoch: () => sceneEpoch,
+    // World changes the fluids cause (obsidian, burning, cooling, floating
+    // wood) are ordinary persisted edits, echoed back to every worker.
+    applyEffect: (e) => {
+      if (e.op === 'base') setVoxel(e.x, e.y, e.z, e.id);
+      else setSubVoxel(e.x, e.y, e.z, e.s, e.id);
     },
   });
+  worldWorkers.push(fluidSim.worker);
 
   const select = el('scene-select');
   for (const s of state.config.scenes) {
@@ -2023,9 +1902,8 @@ animate();
 window.__voxel = {
   state, getVoxel, setVoxel, setSubVoxel, destroyBlock, placeBlock,
   pickBlock, raycastVoxel, storedCount, cycleVoxelSize, decompose,
-  toolSizeMm, sendGameEvent, isSolidCell, blockAtCell, loadedFaucets,
+  toolSizeMm, sendGameEvent, loadedFaucets, ensureNotStuck, findFreeSpot,
   getScreens: () => screenMgr, getFluids: () => fluidSim, pollUpdates,
   lampLights, boxCollides, apparentHours, syncTime, timeState,
-  lightAt: (x, y, z) => (lightEngine ? lightEngine.lightAt(x, y, z) : null),
   applyVoxelCells, rotateAndNormalize, stepsFromNormal,
 };

@@ -15,6 +15,7 @@ Run with either:
 API:
   GET  /api/config                     -> materials, scenes, chunk size, default scene
   GET  /api/chunk?scene=S&cx=N&cz=N    -> one chunk of voxel data (base64 uint16 LE)
+       ...&format=bin                  -> the same chunk as gzip'd binary sections
   POST /api/edits                      -> persist block edits {scene, edits:[{x,y,z,id}]}
   POST /api/schematic/import?scene=S&tx=&ty=&tz=&nx=&ny=&nz= (raw file body)
                                         -> {jobId} — background import, see schematic_import.py
@@ -22,39 +23,54 @@ API:
 """
 
 import argparse
+import atexit
 import base64
+import gzip
 import json
 import re
 import struct
+import sys
 import threading
 import time
 import urllib.request
 import uuid
+from array import array
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import schematic_import
+from storage import WorldStore, NO_EDIT
 from materials import MATERIALS, NAME_TO_ID
 from worldgen import (build_scenes, build_world, WORLD_TYPES, DEFAULT_SCENE,
                       CHUNK_X, CHUNK_Y, CHUNK_Z, VOXEL_SIZE_MM,
                       MIN_VOXEL_SIZE_MM, VOXEL_SIZES_MM)
 
 STATIC_DIR = Path(__file__).parent / "static"
+# Legacy JSON state file: migrated into DB_FILE on first start, then renamed.
 STATE_FILE = Path(__file__).parent / "world_state.json"
+DB_FILE = Path(__file__).parent / "world_state.db"
+
+# Chunks are split vertically into SECTION_H-tall sections: storage keeps
+# edits per section, and the binary chunk format skips all-air sections.
+SECTION_H = 16
+N_SECTIONS = CHUNK_Y // SECTION_H
+SECTION_CELLS = CHUNK_X * CHUNK_Z * SECTION_H
+SECTION_BYTES = SECTION_CELLS * 2
+ZERO_SECTION = bytes(SECTION_BYTES)
+CHUNK_MAGIC = b"VXC1"
 
 # SCENES is dynamic: worlds can be created/deleted at runtime (see
 # register_scene/unregister_scene below), not just the 3 built-in demo
 # scenes assembled by build_scenes() at import time.
 SCENES = {}
 
-# Edit stores, applied on top of generated chunks and persisted to
-# STATE_FILE so world changes survive server restarts.
-#   EDITS:     {scene: {(x, y, z): material_id}}          base 1000 mm grid
-#   SUBVOXELS: {scene: {(x_mm, y_mm, z_mm, size_mm): id}}  smaller voxels
-EDITS = {}
-SUBVOXELS = {}
-EDITS_LOCK = threading.Lock()
+# Edits are applied on top of generated chunks and persisted in DB_FILE (see
+# storage.py): base 1000 mm grid edits per 16^3 section, smaller voxels per
+# chunk column. STORE.lock doubles as the edit lock for the revision log.
+STORE = WorldStore(DB_FILE, CHUNK_X, CHUNK_Z, SECTION_H)
+EDITS_LOCK = STORE.lock
 
 SUB_SIZES = [s for s in VOXEL_SIZES_MM if s < VOXEL_SIZE_MM]
 
@@ -88,8 +104,7 @@ def register_scene(scene):
     initializing all of its per-scene bookkeeping dicts."""
     name = scene.name
     SCENES[name] = scene
-    EDITS.setdefault(name, {})
-    SUBVOXELS.setdefault(name, {})
+    STORE.add_scene(name)
     REV.setdefault(name, 0)
     EDIT_LOG.setdefault(name, [])
     SENSOR_COUNTS.setdefault(name, {"touch": 0, "light": 0, "pressure": 0})
@@ -99,16 +114,16 @@ def register_scene(scene):
 def unregister_scene(name):
     """Remove a custom world and all of its bookkeeping/cache entries."""
     SCENES.pop(name, None)
-    EDITS.pop(name, None)
-    SUBVOXELS.pop(name, None)
+    STORE.drop_scene(name)
     REV.pop(name, None)
     EDIT_LOG.pop(name, None)
     SENSOR_COUNTS.pop(name, None)
     SENSOR_LOG.pop(name, None)
     WORLD_DEFS.pop(name, None)
     with CHUNK_CACHE_LOCK:
-        for key in [k for k in CHUNK_CACHE if k[0] == name]:
-            del CHUNK_CACHE[key]
+        for cache in (CHUNK_CACHE, PAYLOAD_CACHE):
+            for key in [k for k in cache if k[0] == name]:
+                del cache[key]
 
 
 def slugify(title, existing):
@@ -188,7 +203,10 @@ FLUID_CONFIG = {
     # number; at most this many active cells per type are stepped each
     # tick (a rotating window), so more moving fluid just moves slower.
     "maxCellsPerType": 4000,
-    "settleAfterTicks": 8,        # ticks without movement before settling
+    # Steps without any change before a cell settles. The level-based
+    # simulation is deterministic apart from the order it tries directions
+    # in, so an unchanged cell stays unchanged until a neighbour wakes it.
+    "settleAfterTicks": 2,
     "tickMs": 100,
 }
 
@@ -245,15 +263,15 @@ def _trim_jobs():
 def _run_schematic_job(job, scene, target, normal, raw_bytes):
     """Background-thread worker for a schematic import: parses/places the
     file (the potentially slow part, run without holding EDITS_LOCK so it
-    doesn't block other players/requests), then does one bulk write into
-    EDITS[scene] under the lock."""
+    doesn't block other players/requests) straight into 16^3 section
+    overlays, then merges those into the store in one bulk write."""
     def progress_cb(processed, total):
         with JOBS_LOCK:
             job["processed"] = processed
             job["total"] = total
 
     try:
-        edits, unmapped, bbox = schematic_import.parse_and_place(
+        sections, applied, unmapped, bbox = schematic_import.parse_and_place(
             raw_bytes, NAME_TO_ID, target, normal, CHUNK_Y, progress_cb)
     except schematic_import.SchematicTooLarge as e:
         with JOBS_LOCK:
@@ -266,27 +284,20 @@ def _run_schematic_job(job, scene, target, normal, raw_bytes):
             job["error"] = f"could not parse schematic: {e}"
         return
 
-    applied = 0
     with EDITS_LOCK:
-        store = EDITS.get(scene)
-        if store is None:
+        if scene not in SCENES:
             with JOBS_LOCK:
                 job["status"] = "error"
                 job["error"] = "scene no longer exists"
             return
-        store.update(edits)
-        applied = len(edits)
-        # One "bulk" marker (with the affected bounding box) instead of one
-        # log entry per cell — a large import can be millions of cells, and
-        # the log is capped (and /api/updates only returns 500/poll), so
-        # per-cell logging would make large imports take an impractically
-        # long time to sync via the normal incremental-edit mechanism.
-        # Clients treat "bulk" as "go refetch any of my loaded chunks that
-        # intersect this box" instead of replaying it cell by cell.
         if applied:
+            STORE.merge_sections(scene, sections)
+            # One "bulk" marker (with the affected bounding box) instead of
+            # one log entry per cell — a large import can be millions of
+            # cells, and the log is capped (and /api/updates only returns
+            # 500/poll). Clients treat "bulk" as "go refetch any of my
+            # loaded chunks that intersect this box".
             record_edit(scene, {"op": "bulk", "bbox": list(bbox)})
-    if applied:
-        save_state()
 
     with JOBS_LOCK:
         job["status"] = "done"
@@ -298,19 +309,28 @@ def _run_schematic_job(job, scene, target, normal, raw_bytes):
 def backend_set_block(scene, x, y, z, mat):
     """World edit made by the backend itself (event reactions etc.)."""
     with EDITS_LOCK:
-        EDITS[scene][(x, y, z)] = mat
+        STORE.set_edit(scene, x, y, z, mat)
         record_edit(scene, {"op": "set", "x": x, "y": y, "z": z, "id": mat})
 
 
-def load_state():
-    if not STATE_FILE.is_file():
-        return
-    try:
-        data = json.loads(STATE_FILE.read_text())
-    except (OSError, json.JSONDecodeError) as err:
-        print(f"warning: could not load {STATE_FILE.name}: {err}")
-        return
-    saved_time = data.get("time")
+def build_meta():
+    """Everything besides voxel edits that must survive a restart, as
+    {kv key: JSON-able value}; written by STORE's flush thread."""
+    meta = {"worlds": [{"id": name, **d} for name, d in WORLD_DEFS.items()],
+            "screens": {name: list(sc.screens.values())
+                        for name, sc in SCENES.items()}}
+    with TIME_LOCK:
+        meta["time"] = dict(TIME_STATE)
+    return meta
+
+
+def save_state():
+    """Schedule metadata (worlds, screens, clock) for the next flush. Voxel
+    edits mark themselves dirty in STORE; nothing is written synchronously."""
+    STORE.mark_meta_dirty()
+
+
+def _restore_time(saved_time):
     if saved_time:
         with TIME_LOCK:
             TIME_STATE.update({
@@ -318,9 +338,12 @@ def load_state():
                 "speed": float(saved_time.get("speed", 4.0)),
                 "setAt": float(saved_time.get("setAt", time.time())),
             })
-    # Rebuild custom worlds BEFORE loading per-scene edits/screens below, so
-    # that loop's "if scene not in SCENES: continue" guard picks them up too.
-    for w in data.get("worlds", []):
+
+
+def _restore_worlds(worlds):
+    # Rebuild custom worlds BEFORE restoring per-scene data, so the
+    # "if scene not in SCENES" guards pick them up too.
+    for w in worlds or []:
         try:
             if w["type"] not in WORLD_TYPES:
                 continue
@@ -330,47 +353,68 @@ def load_state():
                                    "params": w["params"]}
         except (KeyError, TypeError, ValueError) as err:
             print(f"warning: could not rebuild world {w!r}: {err}")
+
+
+def _restore_screens(scene, screens):
+    sc = SCENES[scene]
+    for saved in screens:
+        if saved["id"] in sc.screens:
+            # Scene-defined screen: restore its (possibly updated) content
+            sc.screens[saved["id"]]["content"] = saved["content"]
+            sc.screens[saved["id"]]["version"] = saved["version"]
+        elif saved.get("runtime"):
+            # Screen created at runtime through the API
+            sc.add_screen(saved["id"], saved["origin"], saved["facing"],
+                          saved["w"], saved["h"],
+                          saved["content"]["type"],
+                          saved["content"]["data"])
+            sc.screens[saved["id"]]["version"] = saved["version"]
+            sc.screens[saved["id"]]["runtime"] = True
+
+
+def migrate_json_state():
+    """One-time import of a legacy world_state.json into the SQLite store.
+    The JSON file is renamed afterwards (kept as a backup)."""
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as err:
+        print(f"warning: could not load {STATE_FILE.name}: {err}")
+        return
+    print(f"  migrating {STATE_FILE.name} into {DB_FILE.name} ...")
+    _restore_time(data.get("time"))
+    _restore_worlds(data.get("worlds", []))
     for scene, stores in data.get("scenes", {}).items():
         if scene not in SCENES:
             continue
-        EDITS[scene] = {
-            (int(x), int(y), int(z)): int(m)
-            for x, y, z, m in stores.get("base", [])}
-        SUBVOXELS[scene] = {
-            (int(x), int(y), int(z), int(s)): int(m)
-            for x, y, z, s, m in stores.get("sub", [])}
-        for saved in stores.get("screens", []):
-            sc = SCENES[scene]
-            if saved["id"] in sc.screens:
-                # Scene-defined screen: restore its (possibly updated) content
-                sc.screens[saved["id"]]["content"] = saved["content"]
-                sc.screens[saved["id"]]["version"] = saved["version"]
-            elif saved.get("runtime"):
-                # Screen created at runtime through the API
-                sc.add_screen(saved["id"], saved["origin"], saved["facing"],
-                              saved["w"], saved["h"],
-                              saved["content"]["type"],
-                              saved["content"]["data"])
-                sc.screens[saved["id"]]["version"] = saved["version"]
-                sc.screens[saved["id"]]["runtime"] = True
+        for x, y, z, m in stores.get("base", []):
+            STORE.set_edit(scene, int(x), int(y), int(z), int(m))
+        for x, y, z, s, m in stores.get("sub", []):
+            STORE.set_sub(scene, int(x), int(y), int(z), int(s), int(m))
+        _restore_screens(scene, stores.get("screens", []))
+    save_state()
+    STORE.flush()
+    STATE_FILE.replace(STATE_FILE.with_suffix(".json.migrated"))
 
 
-def save_state():
-    with EDITS_LOCK:
-        data = {"scenes": {name: {
-            "base": [[x, y, z, m] for (x, y, z), m in EDITS[name].items()],
-            "sub": [[x, y, z, s, m]
-                    for (x, y, z, s), m in SUBVOXELS[name].items()],
-            "screens": list(SCENES[name].screens.values()),
-        } for name in SCENES}}
-    data["worlds"] = [{"id": name, **d} for name, d in WORLD_DEFS.items()]
-    with TIME_LOCK:
-        data["time"] = dict(TIME_STATE)
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data))
-    tmp.replace(STATE_FILE)
+def load_state():
+    STORE.meta_provider = build_meta
+    if not STORE.has_data() and STATE_FILE.is_file():
+        migrate_json_state()
+        return
+    meta = STORE.load_meta()
+    _restore_time(meta.get("time"))
+    _restore_worlds(meta.get("worlds", []))
+    for scene, screens in (meta.get("screens") or {}).items():
+        if scene in SCENES:
+            _restore_screens(scene, screens)
 
-CHUNK_CACHE = {}
+
+# Generated terrain per chunk (array('H')), and finished gzip'd binary chunk
+# payloads keyed by the column's STORE version. Both are LRU-bounded.
+CHUNK_CACHE = OrderedDict()
+CHUNK_CACHE_MAX = 64
+PAYLOAD_CACHE = OrderedDict()   # (scene, cx, cz) -> (version, gzip bytes)
+PAYLOAD_CACHE_MAX = 4096
 CHUNK_CACHE_LOCK = threading.Lock()
 
 MIME_TYPES = {
@@ -383,15 +427,26 @@ MIME_TYPES = {
 }
 
 
-def get_chunk_voxels(scene_name, cx, cz):
+def _generated_chunk(scene_name, cx, cz):
     key = (scene_name, cx, cz)
     with CHUNK_CACHE_LOCK:
         cached = CHUNK_CACHE.get(key)
-    if cached is None:
-        cached = SCENES[scene_name].generate_chunk(cx, cz)
-        with CHUNK_CACHE_LOCK:
-            CHUNK_CACHE[key] = cached
-    voxels = list(cached)
+        if cached is not None:
+            CHUNK_CACHE.move_to_end(key)
+            return cached
+    cached = array("H", SCENES[scene_name].generate_chunk(cx, cz))
+    with CHUNK_CACHE_LOCK:
+        CHUNK_CACHE[key] = cached
+        while len(CHUNK_CACHE) > CHUNK_CACHE_MAX:
+            CHUNK_CACHE.popitem(last=False)
+    return cached
+
+
+def get_chunk_voxels(scene_name, cx, cz):
+    """The chunk as players see it: generated terrain, then backend
+    fixtures, then stored edits. Returns array('H') indexed
+    x + z*CHUNK_X + y*CHUNK_X*CHUNK_Z."""
+    voxels = array("H", _generated_chunk(scene_name, cx, cz))
 
     layer = CHUNK_X * CHUNK_Z
     # Backend fixtures (screens, sensors) sit on top of generated terrain
@@ -404,15 +459,62 @@ def get_chunk_voxels(scene_name, cx, cz):
             lz = z - cz * CHUNK_Z
             voxels[lx + lz * CHUNK_X + y * layer] = mat
     with EDITS_LOCK:
-        scene_edits = EDITS[scene_name]
-        for (x, y, z), mat in scene_edits.items():
-            if (cx * CHUNK_X <= x < (cx + 1) * CHUNK_X
-                    and cz * CHUNK_Z <= z < (cz + 1) * CHUNK_Z
-                    and 0 <= y < CHUNK_Y):
-                lx = x - cx * CHUNK_X
-                lz = z - cz * CHUNK_Z
-                voxels[lx + lz * CHUNK_X + y * layer] = mat
+        for sy, overlay in STORE.column_overlays(scene_name, cx, cz).items():
+            if not 0 <= sy < N_SECTIONS:
+                continue
+            base = sy * SECTION_CELLS
+            if NO_EDIT not in overlay:
+                # Fully edited section (e.g. schematic interior): one copy.
+                voxels[base:base + SECTION_CELLS] = overlay
+                continue
+            for i, v in enumerate(overlay):
+                if v != NO_EDIT:
+                    voxels[base + i] = v
     return voxels
+
+
+def build_chunk_binary(scene_name, cx, cz):
+    """Binary chunk format (little endian), served gzip'd:
+      header  magic "VXC1", int32 cx, int32 cz, uint16 sectionCount,
+              uint16 totalSections, uint32 subCount          (20 bytes)
+      per non-empty section: uint16 sy, uint16[CHUNK_X*CHUNK_Z*16] voxels
+              (index lx + lz*CHUNK_X + ly*CHUNK_X*CHUNK_Z)
+      per sub-voxel: int32 x_mm, y_mm, z_mm, uint16 size_mm, material
+    All-air sections are left out entirely."""
+    voxels = get_chunk_voxels(scene_name, cx, cz)
+    if sys.byteorder == "big":
+        voxels.byteswap()
+    raw = voxels.tobytes()
+    parts = []
+    for sy in range(N_SECTIONS):
+        chunk = raw[sy * SECTION_BYTES:(sy + 1) * SECTION_BYTES]
+        if chunk != ZERO_SECTION:
+            parts.append(struct.pack("<H", sy))
+            parts.append(chunk)
+    subs = STORE.column_subs(scene_name, cx, cz)
+    header = struct.pack("<4siiHHI", CHUNK_MAGIC, cx, cz, len(parts) // 2,
+                         N_SECTIONS, len(subs))
+    parts.insert(0, header)
+    for x, y, z, s, m in subs:
+        parts.append(struct.pack("<iiiHH", x, y, z, s, m))
+    return b"".join(parts)
+
+
+def chunk_payload_gzip(scene_name, cx, cz):
+    """Cached gzip'd binary chunk; rebuilt only when the column changed."""
+    key = (scene_name, cx, cz)
+    version = STORE.version(scene_name, cx, cz)
+    with CHUNK_CACHE_LOCK:
+        hit = PAYLOAD_CACHE.get(key)
+        if hit is not None and hit[0] == version:
+            PAYLOAD_CACHE.move_to_end(key)
+            return hit[1]
+    body = gzip.compress(build_chunk_binary(scene_name, cx, cz), 6)
+    with CHUNK_CACHE_LOCK:
+        PAYLOAD_CACHE[key] = (version, body)
+        while len(PAYLOAD_CACHE) > PAYLOAD_CACHE_MAX:
+            PAYLOAD_CACHE.popitem(last=False)
+    return body
 
 
 def handle_game_event(scene_name, action, x, y, z, on):
@@ -437,7 +539,7 @@ def handle_game_event(scene_name, action, x, y, z, on):
     if action == "touch":
         # Toggle on each touch
         with EDITS_LOCK:
-            current = EDITS[scene_name].get((x, y + 2, z), 0)
+            current = STORE.get_edit(scene_name, x, y + 2, z) or 0
         backend_set_block(scene_name, x, y + 2, z, 0 if current else indicator)
     else:
         backend_set_block(scene_name, x, y + 2, z, indicator if on else 0)
@@ -558,24 +660,33 @@ class Handler(BaseHTTPRequestHandler):
         if abs(cx) > 4096 or abs(cz) > 4096:
             return self.send_error_json("chunk out of range")
 
+        if query.get("format", ["json"])[0] == "bin":
+            body = chunk_payload_gzip(scene, cx, cz)
+            gzip_ok = "gzip" in self.headers.get("Accept-Encoding", "")
+            if not gzip_ok:
+                body = gzip.decompress(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            if gzip_ok:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         voxels = get_chunk_voxels(scene, cx, cz)
-        packed = struct.pack(f"<{len(voxels)}H", *voxels)
-
-        x0, x1 = cx * CHUNK_X * 1000, (cx + 1) * CHUNK_X * 1000
-        z0, z1 = cz * CHUNK_Z * 1000, (cz + 1) * CHUNK_Z * 1000
-        with EDITS_LOCK:
-            subs = [[x, y, z, s, m]
-                    for (x, y, z, s), m in SUBVOXELS[scene].items()
-                    if x0 <= x < x1 and z0 <= z < z1]
-
+        if sys.byteorder == "big":
+            voxels.byteswap()
         self.send_json({
             "scene": scene,
             "cx": cx,
             "cz": cz,
             "size": [CHUNK_X, CHUNK_Y, CHUNK_Z],
             "encoding": "base64-uint16-le",
-            "voxels": base64.b64encode(packed).decode("ascii"),
-            "subvoxels": subs,  # [x_mm, y_mm, z_mm, size_mm, material_id]
+            "voxels": base64.b64encode(voxels.tobytes()).decode("ascii"),
+            # [x_mm, y_mm, z_mm, size_mm, material_id]
+            "subvoxels": STORE.column_subs(scene, cx, cz),
         })
 
     def handle_edits(self):
@@ -591,8 +702,6 @@ class Handler(BaseHTTPRequestHandler):
         applied = 0
         max_id = len(MATERIALS)
         with EDITS_LOCK:
-            store = EDITS[scene]
-            substore = SUBVOXELS[scene]
             for e in edits[:8192]:
                 try:
                     op = e.get("op", "set")
@@ -604,7 +713,7 @@ class Handler(BaseHTTPRequestHandler):
                         x, y, z = int(e["x"]), int(e["y"]), int(e["z"])
                         if not 0 <= y < CHUNK_Y:
                             continue
-                        store[(x, y, z)] = mat
+                        STORE.set_edit(scene, x, y, z, mat)
                         record_edit(scene,
                                     {"op": "set", "x": x, "y": y, "z": z,
                                      "id": mat})
@@ -619,19 +728,13 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                         if not 0 <= y < CHUNK_Y * 1000:
                             continue
-                        key = (x, y, z, s)
-                        if mat == 0:
-                            substore.pop(key, None)
-                        else:
-                            substore[key] = mat
+                        STORE.set_sub(scene, x, y, z, s, mat)
                         record_edit(scene,
                                     {"op": "sub", "x": x, "y": y, "z": z,
                                      "s": s, "id": mat})
                         applied += 1
                 except (KeyError, TypeError, ValueError, AttributeError):
                     continue
-        if applied:
-            save_state()
         self.send_json({"ok": True, "applied": applied})
 
     # ---- screens ----
@@ -985,10 +1088,11 @@ def main():
     args = parser.parse_args()
 
     load_state()
+    atexit.register(STORE.close)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Voxel world backend: http://{args.host}:{args.port}")
     print(f"  materials: {len(MATERIALS)}   scenes: {', '.join(SCENES)}")
-    print(f"  world state file: {STATE_FILE}")
+    print(f"  world database: {DB_FILE}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
